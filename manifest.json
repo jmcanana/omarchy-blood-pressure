@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "jmcanana.pressure",
+  "name": "Pressure",
+  "version": "0.1.0",
+  "author": "jmcanana",
+  "license": "MIT",
+  "description": "Local Blood Pressure Profile sync for the Omarchy bar. Readings stay on this computer.",
+  "kinds": ["bar-widget", "service"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Pressure",
+    "category": "Health",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
