@@ -71,7 +71,7 @@ BarWidget {
       if (root.syncState === "setup") return "Setup"
       return "BP"
     }
-    tooltipText: "Pressure. Readings stay inside the panel."
+    tooltipText: "Blood Pressure. Readings stay on this computer."
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.toggle()
     }

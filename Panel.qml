@@ -236,7 +236,7 @@ Panel {
           height: pill.height
           Text {
             anchors.verticalCenter: parent.verticalCenter
-            text: "Pressure"
+            text: "Blood Pressure"
             color: root.ink
             font.family: root.family
             font.pixelSize: Style.font.heading
@@ -376,7 +376,7 @@ Panel {
 
           Text {
             visible: root.capturing
-            text: "Pressure · " + (root.summary.patient || "") + " · " + Qt.formatDateTime(new Date(), "MMM d, yyyy")
+            text: "Blood Pressure · " + (root.summary.patient || "") + " · " + Qt.formatDateTime(new Date(), "MMM d, yyyy")
             textFormat: Text.PlainText
             color: root.ink
             font.family: root.family
