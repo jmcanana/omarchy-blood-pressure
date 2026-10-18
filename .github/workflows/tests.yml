@@ -7,6 +7,9 @@ on:
 jobs:
   unit:
     runs-on: ubuntu-latest
+    env:
+      # The clock test vector was recorded on a cuff set to Toronto time.
+      TZ: America/Toronto
     strategy:
       matrix:
         python: ["3.12", "3.13"]
