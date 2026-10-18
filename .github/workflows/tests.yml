@@ -1,0 +1,21 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests (no radio, synthetic data only)
+        run: python -m unittest discover -s tests -v
+      - name: Sidecar self-check
+        run: python pressure/sidecar.py --self-check --data "$RUNNER_TEMP/bp/data" --state "$RUNNER_TEMP/bp/state"
