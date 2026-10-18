@@ -9,3 +9,4 @@ venv/
 .DS_Store
 *.png
 !docs/screenshots/*.png
+!preview.png
