@@ -11,7 +11,7 @@ Rectangle {
   property string fontFamily: Style.font.family
 
   readonly property string mode: {
-    if (linkState === "error") return "error"
+    if (linkState === "error" || linkState === "setup") return "error"
     if (linkState === "connecting" || linkState === "draining") return "syncing"
     if (linkState === "ready") return "measuring"
     if (lastSync && justSynced) return "synced"
@@ -35,7 +35,7 @@ Rectangle {
   }
 
   readonly property string label: {
-    if (mode === "error") return "Sync failed · retries next time"
+    if (mode === "error") return linkState === "setup" ? "Bluetooth setup needed" : "Sync failed · retries next time"
     if (mode === "syncing") return "Syncing"
     if (mode === "measuring") return "Measuring · waiting for light"
     if (mode === "synced") return "Synced " + lastSync.stored + " · " + lastSync.at

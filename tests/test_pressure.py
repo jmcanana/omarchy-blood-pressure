@@ -408,6 +408,30 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(store.setting("synthetic"), "1")
 
 
+class SetupTests(unittest.TestCase):
+    def test_missing_bleak_leaves_the_panel_working_and_says_setup(self) -> None:
+        import asyncio
+        import sys
+
+        from pressure import sidecar
+
+        store, _root = _store()
+        live: dict = {}
+        saved = sys.modules.get("bleak", "absent")
+        sys.modules["bleak"] = None  # an import of bleak now raises ImportError
+        try:
+            asyncio.run(asyncio.wait_for(sidecar._radio(store, live), 2))
+        finally:
+            if saved == "absent":
+                del sys.modules["bleak"]
+            else:
+                sys.modules["bleak"] = saved
+        self.assertEqual(live["state"], "setup")
+        status = json.loads(store.status_path.read_text(encoding="utf-8"))
+        self.assertEqual((status["state"], status["error"]), ("setup", sidecar.BLEAK_MISSING))
+        self.assertTrue(handle(store, {"op": "summary"})["ok"])
+
+
 class DrainTests(unittest.TestCase):
     def test_burst_is_stored_and_the_clock_stays_unwritten(self) -> None:
         store, _root = _store()

@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "jmcanana.pressure",
-  "name": "Pressure",
+  "name": "Blood Pressure",
   "version": "0.1.0",
   "author": "jmcanana",
   "license": "MIT",
-  "description": "Local Blood Pressure Profile sync for the Omarchy bar. Readings stay on this computer.",
+  "description": "Your blood-pressure cuff, synced to your Omarchy desktop over Bluetooth LE. Readings stay on your computer. Not a medical device.",
   "kinds": ["bar-widget", "service"],
   "keepLoaded": true,
   "entryPoints": {
@@ -13,7 +13,7 @@
     "service": "Service.qml"
   },
   "barWidget": {
-    "displayName": "Pressure",
+    "displayName": "Blood Pressure",
     "category": "Health",
     "allowMultiple": false,
     "defaultSection": "right"

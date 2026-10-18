@@ -6,6 +6,7 @@ Stdout is one line, ``ready``, and then silence. Readings never go to the log.
 from __future__ import annotations
 
 import argparse
+import importlib
 import asyncio
 import json
 import sys
@@ -61,18 +62,23 @@ async def serve(store: Store, state: Path) -> None:
     live = {"state": "starting", "beacon": "none", "link": False, "error": ""}
     store.write_status(state="starting", beacon="none", link=False, error="")
     print("ready", flush=True)
-    try:
-        await asyncio.gather(
-            _commands_clean(store, state, live),
-            _radio(store, live),
-        )
-    except ImportError:
-        live["error"] = "bleak is not installed"
-        store.write_status(state="error", beacon="none", link=False, error="bleak is not installed")
-        raise SystemExit(2)
+    await asyncio.gather(
+        _commands_clean(store, state, live),
+        _radio(store, live),
+    )
+
+
+BLEAK_MISSING = "bleak is not installed"
 
 
 async def _radio(store: Store, live: dict) -> None:
+    """Without bleak there is no radio, but the panel keeps working and shows the setup command."""
+    try:
+        importlib.import_module("bleak")
+    except ImportError:
+        live.update(state="setup", error=BLEAK_MISSING)
+        store.write_status(state="setup", beacon="none", link=False, error=BLEAK_MISSING)
+        return
     from pressure.radio import radio_loop
 
     await radio_loop(store, live)

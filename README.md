@@ -77,7 +77,8 @@ You need Omarchy, a Bluetooth adapter, and Python 3.12 or newer.
 git clone https://github.com/jmcanana/omarchy-blood-pressure
 cd omarchy-blood-pressure
 
-# The sidecar's private Bluetooth library (no root needed)
+# The sidecar's private Bluetooth library (no root needed).
+# Skip this and the panel shows a "Bluetooth library not installed" card with the same command to copy.
 python3 -m venv ~/.local/share/jmcanana.pressure/venv
 ~/.local/share/jmcanana.pressure/venv/bin/pip install "bleak==3.0.2"
 

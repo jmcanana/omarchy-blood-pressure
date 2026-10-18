@@ -63,11 +63,12 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    active: root.concern === "severe" || root.concern === "watch" || root.syncState === "error"
+    active: root.concern === "severe" || root.concern === "watch" || root.syncState === "error" || root.syncState === "setup"
     text: {
       if (root.syncState === "draining" || root.syncState === "connecting") return "Sync"
       if (root.syncState === "ready") return "Ready"
       if (root.syncState === "seen") return "New"
+      if (root.syncState === "setup") return "Setup"
       return "BP"
     }
     tooltipText: "Pressure. Readings stay inside the panel."

@@ -137,6 +137,9 @@ Panel {
     font.bold: true
   }
 
+  property bool setupCopied: false
+  readonly property string setupText: "python3 -m venv ~/.local/share/jmcanana.pressure/venv && ~/.local/share/jmcanana.pressure/venv/bin/pip install \"bleak==3.0.2\""
+
   property bool capturing: false
   property bool copied: false
   readonly property string sharePath: root.stateDir + "/pressure-share.png"
@@ -444,6 +447,56 @@ Panel {
                 spacing: Style.space(8)
                 ActionButton { text: "Save"; primary: true; ink: root.ink; fontFamily: root.family; labelColor: root.onAccent(); onClicked: root.saveEditor() }
                 ActionButton { text: "Cancel"; ink: root.ink; fontFamily: root.family; onClicked: root.editing = false }
+              }
+            }
+          }
+
+          // Setup card: the sidecar runs without bleak until the Bluetooth library is installed.
+          Rectangle {
+            visible: root.linkState === "setup"
+            width: parent.width
+            height: setupColumn.implicitHeight + Style.space(28)
+            radius: Style.cornerRadius
+            color: Qt.rgba(Color.urgent.r, Color.urgent.g, Color.urgent.b, 0.08)
+            border.width: 1
+            border.color: Color.urgent
+            Column {
+              id: setupColumn
+              x: Style.space(16)
+              y: Style.space(14)
+              width: parent.width - Style.space(32)
+              spacing: Style.space(8)
+              Text { text: "Bluetooth library not installed"; color: root.ink; font.family: root.family; font.pixelSize: Style.font.title; font.weight: Font.DemiBold }
+              Text { width: parent.width; wrapMode: Text.WordWrap; text: "The plugin needs bleak in its own Python folder. Run this once in a terminal, then run omarchy restart shell:"; color: root.ink; font.family: root.family; font.pixelSize: Style.font.body }
+              Rectangle {
+                width: parent.width
+                height: setupCommand.implicitHeight + Style.space(16)
+                radius: Style.cornerRadius
+                color: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.06)
+                Text {
+                  id: setupCommand
+                  x: Style.space(10)
+                  y: Style.space(8)
+                  width: parent.width - Style.space(20)
+                  wrapMode: Text.WrapAnywhere
+                  textFormat: Text.PlainText
+                  text: root.setupText
+                  color: root.ink
+                  font.family: root.family
+                  font.pixelSize: Style.font.caption
+                }
+              }
+              ActionButton {
+                text: root.setupCopied ? "Copied" : "Copy command"
+                ink: root.ink
+                fontFamily: root.family
+                onClicked: {
+                  clipboard.running = false
+                  clipboard.command = ["wl-copy", "--", root.setupText]
+                  clipboard.running = true
+                  root.setupCopied = true
+                  copiedReset.restart()
+                }
               }
             }
           }
@@ -900,7 +953,7 @@ Panel {
   Timer {
     id: copiedReset
     interval: 2500
-    onTriggered: root.copied = false
+    onTriggered: { root.copied = false; root.setupCopied = false }
   }
 
   FileView {
