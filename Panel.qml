@@ -280,6 +280,7 @@ Panel {
                     anchors.leftMargin: Style.space(12)
                     anchors.verticalCenter: parent.verticalCenter
                     text: parent.modelData.alias
+                    textFormat: Text.PlainText
                     color: root.ink
                     font.family: root.family
                     font.pixelSize: Style.font.body
@@ -373,6 +374,7 @@ Panel {
           Text {
             visible: root.capturing
             text: "Pressure · " + (root.summary.patient || "") + " · " + Qt.formatDateTime(new Date(), "MMM d, yyyy")
+            textFormat: Text.PlainText
             color: root.ink
             font.family: root.family
             font.pixelSize: Style.font.heading
@@ -465,6 +467,7 @@ Panel {
               Text { text: "New monitor nearby"; color: root.ink; font.family: root.family; font.pixelSize: Style.font.title; font.weight: Font.DemiBold }
               Text {
                 text: root.summary.seen ? ((root.summary.seen.name || "Monitor") + " · ends " + root.summary.seen.tail) : ""
+                textFormat: Text.PlainText
                 color: root.ink2; font.family: root.family; font.pixelSize: Style.font.caption
               }
               Text {
@@ -825,6 +828,7 @@ Panel {
               height: Style.space(22)
               Text {
                 anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
                 text: root.monitor
                   ? ((root.monitor.battery !== null && root.monitor.battery !== undefined ? "▮ " + root.monitor.battery + " %   " : "") + (root.monitor.model || "Monitor") + (root.monitor.firmware ? " · fw " + root.monitor.firmware : ""))
                   : "No monitor trusted yet"

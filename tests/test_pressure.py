@@ -631,6 +631,14 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(fresh["tail"], "4402")
         self.assertFalse(store.is_trusted("00:11:22:33:44:01"))
 
+    def test_a_repeated_sighting_keeps_its_token_and_a_changed_one_does_not(self) -> None:
+        store, _root = _store()
+        store.remember_pending("first", "00:11:22:33:44:03", "Cuff", "transfer")
+        store.remember_pending("second", "00:11:22:33:44:03", "Cuff", "transfer")
+        self.assertEqual(store.pending_public()["token"], "first")
+        store.remember_pending("third", "00:11:22:33:44:03", "Cuff renamed", "transfer")
+        self.assertEqual(store.pending_public()["token"], "third")
+
     def test_a_generic_advert_needs_its_own_confirm(self) -> None:
         store, _root = _store()
         store.remember_pending("tok", "00:11:22:33:44:66", "Other", "generic")

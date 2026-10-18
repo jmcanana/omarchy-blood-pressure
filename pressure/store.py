@@ -298,6 +298,12 @@ class Store:
         return bool(row and row["trusted"])
 
     def remember_pending(self, token: str, address: str, name: str, beacon: str) -> None:
+        """Keep one sighting. The same device repeating the same advert keeps its token, so a Trust tap
+        is not outrun by the next advert and the database is not rewritten twenty times a second;
+        any change of address, name or beacon replaces the token."""
+        row = self._db.execute("SELECT address, name, beacon FROM pending LIMIT 1").fetchone()
+        if row is not None and (row["address"], row["name"], row["beacon"]) == (address.lower(), name, beacon):
+            return
         self._db.execute("DELETE FROM pending")
         self._db.execute(
             "INSERT INTO pending(token, address, name, beacon, seen_at) VALUES(?, ?, ?, ?, ?)",

@@ -79,7 +79,7 @@ cd omarchy-blood-pressure
 
 # The sidecar's private Bluetooth library (no root needed)
 python3 -m venv ~/.local/share/jmcanana.pressure/venv
-~/.local/share/jmcanana.pressure/venv/bin/pip install bleak
+~/.local/share/jmcanana.pressure/venv/bin/pip install "bleak==3.0.2"
 
 # Load it into the shell
 rsync -a --delete --exclude .git --exclude docs ./ ~/.config/omarchy/plugins/jmcanana.pressure/
