@@ -37,11 +37,13 @@ An [Omarchy](https://omarchy.org) bar plugin for home blood-pressure monitors. T
 
 Every number and name below is synthetic, seeded by `pressure/demo.py`. None is a real measurement.
 
-| Adult, AHA table | Same reading, ESC 2024 table |
+Each one is in a different Omarchy theme: every colour comes from the active theme.
+
+| Adult, AHA table · *Tokyo Night* | Same reading, ESC 2024 table · *Catppuccin Latte* |
 |---|---|
-| ![Alex, AHA](docs/screenshots/alex-aha.png) | ![Alex, ESC](docs/screenshots/alex-esc.png) |
-| **Under 13: numbers without bands** | **Above the crisis line: severe guidance** |
-| ![Sam, under 13](docs/screenshots/sam-under13.png) | ![Jordan, severe](docs/screenshots/jordan-severe.png) |
+| ![Alex, AHA, Tokyo Night](docs/screenshots/alex-aha.png) | ![Alex, ESC, Catppuccin Latte](docs/screenshots/alex-esc.png) |
+| **Under 13: numbers without bands** · *Gruvbox* | **Above the crisis line: severe guidance** · *Rosé Pine* |
+| ![Sam, under 13, Gruvbox](docs/screenshots/sam-under13.png) | ![Jordan, severe, Rosé Pine](docs/screenshots/jordan-severe.png) |
 
 ## How it works
 
