@@ -8,4 +8,5 @@ py=python3
 if [[ -x "$data/venv/bin/python" ]]; then
   py="$data/venv/bin/python"
 fi
-exec "$py" "$root/pressure/sidecar.py" "$@"
+# exec keeps this pid, so $PPID is the shell the sidecar must not outlive.
+exec "$py" "$root/pressure/sidecar.py" --parent-pid "$PPID" "$@"

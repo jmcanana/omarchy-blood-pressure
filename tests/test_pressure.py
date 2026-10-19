@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import gc
 import json
+import logging
+import os
 import re
+import signal
+import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -592,6 +598,249 @@ class PanelPrivacyTests(unittest.TestCase):
         with mock.patch.object(sidecar, "handle", recording_handle), mock.patch.object(Path, "unlink", unlink_after_a_new_command):
             asyncio.run(run())
         self.assertEqual(handled, ["1", "2"])
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat = Path(f"/proc/{pid}/stat")
+    return not (stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+
+
+def _wait_for(check, seconds: float = 8.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class LifetimeTests(unittest.TestCase):
+    """A shell restart once left the old sidecar running beside the new one, both scanning and both
+    writing the same database."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        # A bleak that cannot import keeps these sidecars off the radio on a machine that has it.
+        stub = self.root / "stub"
+        stub.mkdir()
+        (stub / "bleak.py").write_text("raise ImportError('no radio in tests')\n", encoding="utf-8")
+        self.env = dict(os.environ, PYTHONPATH=str(stub), XDG_DATA_HOME=str(self.root / "xdg"))
+        self.shells: list[subprocess.Popen] = []
+        self.sidecars: list[int] = []
+
+    def tearDown(self) -> None:
+        for shell in self.shells:
+            if shell.poll() is None:
+                shell.kill()
+            shell.wait()
+            shell.stdout.close()
+        for pid in self.sidecars:
+            if _alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+    def start(self, name: str) -> tuple[subprocess.Popen, int, Path]:
+        """Start pressure/run under a stand-in shell, as Service.qml does; return the shell, the sidecar pid
+        and the sidecar's stdout."""
+        run = Path(__file__).resolve().parent.parent / "pressure" / "run"
+        out = self.root / f"{name}.out"
+        shell = subprocess.Popen(
+            ["bash", "-c", '"$0" --state "$1" --data "$2" > "$3" & echo $!; wait',
+             str(run), str(self.root / "state"), str(self.root / "data"), str(out)],
+            stdout=subprocess.PIPE, text=True, env=self.env,
+        )
+        self.shells.append(shell)
+        pid = int(shell.stdout.readline())
+        self.sidecars.append(pid)
+        return shell, pid, out
+
+    @staticmethod
+    def ready(out: Path) -> bool:
+        return out.exists() and "ready" in out.read_text(encoding="utf-8")
+
+    def test_a_sidecar_exits_when_its_shell_dies(self) -> None:
+        shell, pid, out = self.start("one")
+        self.assertTrue(_wait_for(lambda: self.ready(out)), "sidecar never started")
+        shell.kill()
+        shell.wait()
+        self.assertTrue(_wait_for(lambda: not _alive(pid)), "sidecar outlived its shell")
+        status = json.loads((self.root / "state" / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["state"], "idle")
+
+    def test_a_second_sidecar_waits_until_the_first_has_gone(self) -> None:
+        first_shell, first, first_out = self.start("first")
+        self.assertTrue(_wait_for(lambda: self.ready(first_out)), "first sidecar never started")
+        _second_shell, second, second_out = self.start("second")
+        self.assertFalse(_wait_for(lambda: self.ready(second_out), seconds=2.5), "two sidecars ran at once")
+        self.assertTrue(_alive(second))
+        first_shell.kill()
+        first_shell.wait()
+        self.assertTrue(_wait_for(lambda: not _alive(first)), "first sidecar outlived its shell")
+        self.assertTrue(_wait_for(lambda: self.ready(second_out)), "second sidecar never took over")
+
+    def test_the_lock_admits_one_holder_at_a_time(self) -> None:
+        from pressure import sidecar
+
+        lock = self.root / "sidecar.lock"
+        held = sidecar._try_lock(lock)
+        self.assertIsNotNone(held)
+        self.assertIsNone(sidecar._try_lock(lock))
+        os.close(held)
+        again = sidecar._try_lock(lock)
+        self.assertIsNotNone(again)
+        os.close(again)
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+
+    def test_a_signal_lets_the_sidecar_clean_up_and_exit(self) -> None:
+        for number in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=number.name):
+                shell, pid, out = self.start(number.name)
+                self.assertTrue(_wait_for(lambda: self.ready(out)), "sidecar never started")
+                os.kill(pid, number)
+                self.assertTrue(_wait_for(lambda: not _alive(pid)), "sidecar ignored the signal")
+                status = json.loads((self.root / "state" / "status.json").read_text(encoding="utf-8"))
+                self.assertEqual(status["state"], "idle")
+                shell.wait()
+
+    def test_work_ends_normally_without_a_parent_to_watch(self) -> None:
+        import asyncio
+
+        from pressure import sidecar
+
+        finished: list[bool] = []
+
+        async def work():
+            finished.append(True)
+
+        asyncio.run(sidecar._run_until_stopped(work(), None))
+        self.assertEqual(finished, [True])
+
+    def test_cleanup_that_hangs_is_abandoned(self) -> None:
+        import asyncio
+        from unittest import mock
+
+        from pressure import sidecar
+
+        abandoned: list[float] = []
+        began = time.monotonic()
+
+        async def work():
+            try:
+                await asyncio.sleep(30)
+            finally:
+                await asyncio.sleep(30)  # a disconnect that never returns
+
+        with mock.patch.object(sidecar, "CLEANUP_SECONDS", 0.2), \
+                mock.patch.object(sidecar, "_abandon", lambda: abandoned.append(time.monotonic() - began)):
+            asyncio.run(sidecar._run_until_stopped(work(), parent_pid=-1))  # -1 is never our parent
+        self.assertEqual(len(abandoned), 1)
+        self.assertLess(abandoned[0], 2.0)
+
+    def test_the_lock_outlasts_the_radio_cleanup(self) -> None:
+        """gather released the lock while the radio was still disconnecting, and asyncio.run's second
+        cancel then waited on that disconnect with no deadline."""
+        import asyncio
+        from unittest import mock
+
+        from pressure import sidecar
+
+        state = self.root / "state"
+        lock_path = state / "sidecar.lock"
+        events: list[str] = []
+        abandoned: list[bool] = []
+
+        def lock_state() -> str:
+            probe = sidecar._try_lock(lock_path)
+            if probe is None:
+                return "held"
+            os.close(probe)
+            return "free"
+
+        async def slow_radio(store, live):
+            try:
+                await asyncio.sleep(30)
+            finally:
+                for _ in range(10):  # a disconnect that also absorbs a second cancel
+                    await asyncio.shield(asyncio.sleep(0.05))
+                events.append(f"radio stopped, lock {lock_state()}")
+
+        async def hung_radio(store, live):
+            try:
+                await asyncio.sleep(30)
+            finally:
+                while True:
+                    try:
+                        await asyncio.sleep(30)
+                    except asyncio.CancelledError:
+                        pass
+
+        async def stop_soon(parent_pid, stop):
+            await asyncio.sleep(0.3)
+
+        def run_sidecar() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(sidecar._run_until_stopped(sidecar.supervise(self.root / "data", state), None))
+                events.append(f"sidecar returned, lock {lock_state()}")
+            finally:
+                for task in asyncio.all_tasks(loop):
+                    task.get_coro().close()
+                loop.close()
+
+        with mock.patch.object(sidecar, "_stop_requested", stop_soon), mock.patch.object(sidecar, "_radio", slow_radio):
+            run_sidecar()
+        self.assertEqual(events, ["radio stopped, lock held", "sidecar returned, lock free"])
+
+        with mock.patch.object(sidecar, "_stop_requested", stop_soon), mock.patch.object(sidecar, "_radio", hung_radio), \
+                mock.patch.object(sidecar, "CLEANUP_SECONDS", 0.3), \
+                mock.patch.object(sidecar, "_abandon", lambda: abandoned.append(True)), \
+                mock.patch.object(logging.getLogger("asyncio"), "disabled", True):
+            run_sidecar()
+            gc.collect()  # the abandoned tasks are reported as destroyed while pending; that is the point
+        self.assertEqual(abandoned, [True])
+
+    def test_a_waiting_sidecar_names_the_holder_once(self) -> None:
+        import asyncio
+        import contextlib
+        import io
+        from unittest import mock
+
+        from pressure import sidecar
+
+        state = self.root / "state"
+        state.mkdir()
+        held = sidecar._try_lock(state / "sidecar.lock")
+        said = io.StringIO()
+
+        async def run():
+            waiting = asyncio.create_task(sidecar._single_instance(state))
+            await asyncio.sleep(0.5)
+            self.assertFalse(waiting.done())
+            os.close(held)
+            os.close(await asyncio.wait_for(waiting, 2))
+
+        with mock.patch.object(sidecar, "LOCK_QUIET_SECONDS", 0.1), \
+                mock.patch.object(sidecar, "LOCK_RETRY_SECONDS", 0.05), contextlib.redirect_stderr(said):
+            asyncio.run(run())
+        self.assertEqual(said.getvalue(), f"waiting for sidecar {os.getpid()} to exit\n")
+
+    def test_self_check_and_demo_refuse_directories_in_use(self) -> None:
+        from pressure import sidecar
+
+        state = self.root / "state"
+        state.mkdir()
+        held = sidecar._try_lock(state / "sidecar.lock")
+        try:
+            for flag in ("--self-check", "--demo"):
+                with self.subTest(flag=flag), self.assertRaises(SystemExit) as refused:
+                    sidecar.main([flag, "--data", str(self.root / "data"), "--state", str(state)])
+                self.assertEqual(str(refused.exception), sidecar.ALREADY_RUNNING)
+        finally:
+            os.close(held)
+        self.assertFalse((self.root / "data" / "pressure.sqlite").exists())
 
 
 class DrainTests(unittest.TestCase):

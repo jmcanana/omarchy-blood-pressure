@@ -8,9 +8,12 @@ from __future__ import annotations
 import argparse
 import importlib
 import asyncio
+import fcntl
 import json
 import os
+import signal
 import sys
+import time
 from pathlib import Path
 
 # pressure/run execs this file, so the script directory is on sys.path and the
@@ -64,14 +67,93 @@ async def _commands_clean(store: Store, state: Path, live: dict) -> None:
         )
 
 
+PARENT_POLL_SECONDS = 1.0
+LOCK_RETRY_SECONDS = 1.0
+LOCK_QUIET_SECONDS = 5.0
+CLEANUP_SECONDS = 10.0
+ALREADY_RUNNING = "a sidecar is already using these directories"
+
+
+def _try_lock(path: Path) -> int | None:
+    """Return a descriptor holding the sidecar lock, with our pid written in it for a waiter to name,
+    or None while another sidecar holds it."""
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    os.ftruncate(descriptor, 0)
+    os.write(descriptor, f"{os.getpid()}\n".encode())
+    return descriptor
+
+
+async def _single_instance(state: Path) -> int:
+    """Wait until no other sidecar holds the lock: after a shell restart the old one may still be exiting."""
+    _private_dir(state)
+    lock_path = state / "sidecar.lock"
+    quiet_until = time.monotonic() + LOCK_QUIET_SECONDS
+    while (descriptor := _try_lock(lock_path)) is None:
+        if quiet_until is not None and time.monotonic() >= quiet_until:
+            holder = lock_path.read_text(encoding="utf-8").strip() or "unknown"
+            print(f"waiting for sidecar {holder} to exit", file=sys.stderr, flush=True)
+            quiet_until = None
+        await asyncio.sleep(LOCK_RETRY_SECONDS)
+    return descriptor
+
+
+async def _stop_requested(parent_pid: int | None, stop: asyncio.Event) -> None:
+    """Return on SIGTERM or SIGINT, or once the shell that started us has died: a dead shell does not
+    kill its children."""
+    while not stop.is_set() and (parent_pid is None or os.getppid() == parent_pid):
+        await asyncio.sleep(PARENT_POLL_SECONDS)
+
+
+def _abandon() -> None:
+    """Exit without further cleanup; the kernel releases the lock."""
+    os._exit(0)
+
+
+async def _run_until_stopped(work, parent_pid: int | None) -> None:
+    """Run work until it ends or a stop is requested, then cancel it. Cleanup that hangs (a BlueZ
+    disconnect, say) is abandoned after CLEANUP_SECONDS so the lock is never held by a dead sidecar."""
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for signal_number in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(signal_number, stop.set)
+    job = asyncio.ensure_future(work)
+    watch = asyncio.ensure_future(_stop_requested(parent_pid, stop))
+    done, pending = await asyncio.wait({job, watch}, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    if pending:
+        _finished, stuck = await asyncio.wait(pending, timeout=CLEANUP_SECONDS)
+        if stuck:
+            _abandon()
+    for task in done:
+        task.result()
+
+
+async def supervise(data: Path, state: Path) -> None:
+    lock = await _single_instance(state)
+    try:
+        store = Store(data, state)
+        try:
+            await serve(store, state)
+        finally:
+            store.write_status(state="idle", beacon="none", link=False, error="")
+    finally:
+        os.close(lock)
+
+
 async def serve(store: Store, state: Path) -> None:
     live = {"state": "starting", "beacon": "none", "link": False, "error": ""}
     store.write_status(state="starting", beacon="none", link=False, error="")
     print("ready", flush=True)
-    await asyncio.gather(
-        _commands_clean(store, state, live),
-        _radio(store, live),
-    )
+    # A task group, unlike gather, waits for the radio to finish cancelling before the caller releases the lock.
+    async with asyncio.TaskGroup() as group:
+        group.create_task(_commands_clean(store, state, live))
+        group.create_task(_radio(store, live))
 
 
 BLEAK_MISSING = "bleak is not installed"
@@ -131,23 +213,31 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--state")
     parser.add_argument("--self-check", action="store_true")
     parser.add_argument("--demo", action="store_true")
+    parser.add_argument("--parent-pid", type=int)
     args = parser.parse_args(argv)
     data, state = _dirs(args)
-    if args.self_check:
-        self_check(data, state)
+    if args.self_check or args.demo:
+        _run_offline(args, data, state)
         return
-    if args.demo:
+    asyncio.run(_run_until_stopped(supervise(data, state), args.parent_pid))
+
+
+def _run_offline(args: argparse.Namespace, data: Path, state: Path) -> None:
+    """The self-check and demo write synthetic data, so they refuse directories a sidecar is serving."""
+    _private_dir(state)
+    lock = _try_lock(state / "sidecar.lock")
+    if lock is None:
+        raise SystemExit(ALREADY_RUNNING)
+    try:
+        if args.self_check:
+            self_check(data, state)
+            return
         from pressure.demo import seed
 
-        store = Store(data, state)
-        seed(store)
+        seed(Store(data, state))
         print("DEMO_OK", flush=True)
-        return
-    store = Store(data, state)
-    try:
-        asyncio.run(serve(store, state))
-    except KeyboardInterrupt:
-        store.write_status(state="idle", beacon="none", link=False, error="")
+    finally:
+        os.close(lock)
 
 
 if __name__ == "__main__":
