@@ -81,13 +81,13 @@ cd omarchy-blood-pressure
 
 # The sidecar's private Bluetooth library (no root needed).
 # Skip this and the panel shows a "Bluetooth library not installed" card with the same command to copy.
-python3 -m venv ~/.local/share/jmcanana.pressure/venv
-~/.local/share/jmcanana.pressure/venv/bin/pip install "bleak==3.0.2"
+python3 -m venv ~/.local/share/jmcanana.blood-pressure/venv
+~/.local/share/jmcanana.blood-pressure/venv/bin/pip install "bleak==3.0.2"
 
 # Load it into the shell
-rsync -a --delete --exclude .git --exclude docs ./ ~/.config/omarchy/plugins/jmcanana.pressure/
+rsync -a --delete --exclude .git --exclude docs ./ ~/.config/omarchy/plugins/jmcanana.blood-pressure/
 omarchy-shell shell rescanPlugins
-omarchy plugin enable jmcanana.pressure --section right
+omarchy plugin enable jmcanana.blood-pressure --section right
 ```
 
 Then:
@@ -97,7 +97,7 @@ Then:
 3. **Trust the cuff.** Click **BP** in the bar and add a patient with `+`. Take a measurement; when "New monitor nearby" appears, tap **Trust this monitor**.
 4. **Sync.** From the next measurement on, readings sync by themselves while the cuff's light flashes.
 
-To remove it, run `omarchy plugin disable jmcanana.pressure`, then `omarchy plugin remove jmcanana.pressure`. Your database in `~/.local/share/jmcanana.pressure/` is kept. After changing the sidecar, run `omarchy restart shell`.
+To remove it, run `omarchy plugin disable jmcanana.blood-pressure`, then `omarchy plugin remove jmcanana.blood-pressure`. Your database in `~/.local/share/jmcanana.blood-pressure/` is kept. After changing the sidecar, run `omarchy restart shell`.
 
 ## Privacy
 

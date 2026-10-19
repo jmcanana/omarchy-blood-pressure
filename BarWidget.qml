@@ -5,9 +5,9 @@ import qs.Ui
 
 BarWidget {
   id: root
-  moduleName: "jmcanana.pressure"
+  moduleName: "jmcanana.blood-pressure"
 
-  readonly property string stateDir: (Quickshell.env("HOME") || "") + "/.local/state/jmcanana.pressure"
+  readonly property string stateDir: (Quickshell.env("HOME") || "") + "/.local/state/jmcanana.blood-pressure"
   property string syncState: "idle"
   property string concern: "none"
 

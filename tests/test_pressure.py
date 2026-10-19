@@ -432,6 +432,22 @@ class SetupTests(unittest.TestCase):
         self.assertTrue(handle(store, {"op": "summary"})["ok"])
 
 
+class IdentityTests(unittest.TestCase):
+    def test_every_path_uses_the_manifest_id(self) -> None:
+        import argparse
+
+        from pressure import sidecar
+
+        root = Path(__file__).resolve().parent.parent
+        plugin_id = json.loads((root / "manifest.json").read_text(encoding="utf-8"))["id"]
+        data, state = sidecar._dirs(argparse.Namespace(data=None, state=None))
+        self.assertEqual((data.name, state.name), (plugin_id, plugin_id))
+        for name in ("Service.qml", "Panel.qml", "BarWidget.qml", "pressure/run"):
+            text = (root / name).read_text(encoding="utf-8")
+            self.assertIn(plugin_id, text, name)
+            self.assertNotIn("jmcanana.pressure", text, name)
+
+
 class DrainTests(unittest.TestCase):
     def test_burst_is_stored_and_the_clock_stays_unwritten(self) -> None:
         store, _root = _store()

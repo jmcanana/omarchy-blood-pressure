@@ -19,7 +19,7 @@ Measured on one UA-810CNBLE (advertises as UA-810BLE, firmware `PUA0810_1.01`) o
 
 ## Shape
 
-- `service` keeps a Python sidecar alive. `bar-widget` opens the panel. They share nothing but files under `~/.local/state/jmcanana.pressure` and the database under `~/.local/share/jmcanana.pressure`, both mode `0700` / `0600`.
+- `service` keeps a Python sidecar alive. `bar-widget` opens the panel. They share nothing but files under `~/.local/state/jmcanana.blood-pressure` and the database under `~/.local/share/jmcanana.blood-pressure`, both mode `0700` / `0600`.
 - The sidecar is the only BlueZ client. Quickshell's Bluetooth type can pair a device and cannot read Blood Pressure Measurement.
 - A new monitor is not connected until the panel trusts it. The panel sees a name, a beacon class, and the last four hex digits. The full address stays in the database.
 - Readings bind to a patient by cuff user-id byte. The person shown on screen is a separate choice, so looking at one patient does not claim the next packet.

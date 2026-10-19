@@ -9,7 +9,7 @@ import qs.Ui
 // Every number arrives from the sidecar's view model (pressure/view.py); this file only draws.
 Panel {
   id: root
-  moduleName: "jmcanana.pressure"
+  moduleName: "jmcanana.blood-pressure"
   manageIpc: false
 
   property var anchorItem: null
@@ -25,7 +25,7 @@ Panel {
   property int draftCuffUser: 1
 
   readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string stateDir: home + "/.local/state/jmcanana.pressure"
+  readonly property string stateDir: home + "/.local/state/jmcanana.blood-pressure"
   readonly property string pluginDir: {
     var folder = decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, ""))
     return folder.endsWith("/") ? folder : folder + "/"
@@ -138,7 +138,7 @@ Panel {
   }
 
   property bool setupCopied: false
-  readonly property string setupText: "python3 -m venv ~/.local/share/jmcanana.pressure/venv && ~/.local/share/jmcanana.pressure/venv/bin/pip install \"bleak==3.0.2\""
+  readonly property string setupText: "python3 -m venv ~/.local/share/jmcanana.blood-pressure/venv && ~/.local/share/jmcanana.blood-pressure/venv/bin/pip install \"bleak==3.0.2\""
 
   property bool capturing: false
   property bool copied: false

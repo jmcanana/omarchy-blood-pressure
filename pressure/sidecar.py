@@ -24,8 +24,8 @@ from pressure.store import Store
 
 def _dirs(args: argparse.Namespace) -> tuple[Path, Path]:
     home = Path.home()
-    data = Path(args.data) if args.data else home / ".local" / "share" / "jmcanana.pressure"
-    state = Path(args.state) if args.state else home / ".local" / "state" / "jmcanana.pressure"
+    data = Path(args.data) if args.data else home / ".local" / "share" / "jmcanana.blood-pressure"
+    state = Path(args.state) if args.state else home / ".local" / "state" / "jmcanana.blood-pressure"
     return data, state
 
 

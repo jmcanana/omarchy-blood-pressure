@@ -6,8 +6,8 @@ Item {
   id: root
 
   readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string stateDir: home + "/.local/state/jmcanana.pressure"
-  readonly property string dataDir: home + "/.local/share/jmcanana.pressure"
+  readonly property string stateDir: home + "/.local/state/jmcanana.blood-pressure"
+  readonly property string dataDir: home + "/.local/share/jmcanana.blood-pressure"
   readonly property string pluginDir: {
     var folder = decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, ""))
     return folder.endsWith("/") ? folder : folder + "/"
