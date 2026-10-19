@@ -101,7 +101,7 @@ To remove it, run `omarchy plugin disable jmcanana.blood-pressure`, then `omarch
 
 ## Privacy
 
-- **Everything stays on this computer.** Readings and names live in one SQLite file (mode 0600, in a 0700 directory). There is no network, no account and no telemetry upload.
+- **Everything stays on this computer.** Readings and names live in one SQLite file (mode 0600) in a 0700 directory. The panel talks to the sidecar through small files in a second 0700 directory: status and responses are 0600, the command file and the "Copy image" picture take your umask (0644 by default) and are reachable only through that directory. There is no network, no account and no telemetry upload.
 - **The bar is discreet.** It shows only `BP`, `Sync`, `Ready` or `New`, and turns the theme's urgent colour for stage 2 and above. It never shows a number or a name.
 - **The repository holds no real data.** Tests and screenshots use synthetic data only.
 
@@ -131,7 +131,7 @@ Lint `BarWidget.qml` and `Service.qml` as copies under other names. A file named
 - **Not medical advice.** The bands, sentences and guidance it shows restate published tables (AHA, ESC 2024, AAP 2017) for information only. Do not make medical decisions from it; talk to a qualified clinician. In an emergency, call your local emergency number.
 - **No warranty, no liability.** The software is provided "as is", without warranty of any kind, and the authors are not liable for any claim, damages or other liability arising from its use (see [`LICENSE`](LICENSE)). Readings can be missed, delayed, mis-parsed or mis-classified; you use it at your own risk.
 - **Tested narrowly.** It was built against one A&D UA-810 on one Omarchy machine. Other monitors, firmware or Bluetooth stacks may behave differently.
-- **Your data is yours to protect.** Readings and patient names are stored unencrypted in your home directory (files mode 0600). Securing that computer, and anything you share with "Copy image", is up to you.
+- **Your data is yours to protect.** Readings and patient names are stored unencrypted in your home directory, in 0700 directories (see Privacy). Securing that computer, and anything you share with "Copy image", is up to you.
 - **No affiliation.** Not affiliated with or endorsed by A&D Company / A&D Medical, the American Heart Association, the European Society of Cardiology, the American Academy of Pediatrics, or the Omarchy project. Product names are trademarks of their owners.
 
 ## Sources

@@ -17,6 +17,8 @@ Panel {
   property var summary: ({})
   property string linkState: "idle"
   property int commandId: 1
+  // Ids are unique per session, so a response.json left by an earlier session never matches.
+  readonly property string sessionTag: String(Date.now())
   property int selected: -1
   property bool editing: false
   property var editPatient: null
@@ -26,10 +28,6 @@ Panel {
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string stateDir: home + "/.local/state/jmcanana.blood-pressure"
-  readonly property string pluginDir: {
-    var folder = decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, ""))
-    return folder.endsWith("/") ? folder : folder + "/"
-  }
   readonly property color ink: Color.popups.text
   readonly property color surface: Color.popups.background
   readonly property color ink2: Qt.rgba(ink.r, ink.g, ink.b, inkAlpha(ink, surface, 4.5))
@@ -88,17 +86,25 @@ Panel {
     if (op !== "summary") root.dirty = true
     root.dispatch()
   }
+  // Commands wait until the sidecar has written status.json: the state directory then exists with
+  // mode 0700, so the command file is never what creates it (FileView would create it 0755).
+  property bool sidecarSeen: false
+  function markSidecarSeen() {
+    if (root.sidecarSeen) return
+    root.sidecarSeen = true
+    Qt.callLater(root.dispatch)
+  }
   function dispatch() {
-    if (root.inflight !== "" || root.queue.length === 0) return
+    if (!root.sidecarSeen || root.inflight !== "" || root.queue.length === 0) return
     var body = root.queue[0]
     root.queue = root.queue.slice(1)
-    body.id = String(root.commandId)
+    body.id = root.sessionTag + "-" + root.commandId
     root.commandId += 1
     root.inflight = body.id
     flushGuard.restart()
-    enqueue.running = false
-    enqueue.command = ["python3", root.pluginDir + "pressure/enqueue.py", root.stateDir + "/command.json", JSON.stringify(body)]
-    enqueue.running = true
+    // Written straight to the private state directory: no process, so nothing (patient names
+    // included) appears on a command line that other local users could list.
+    commandFile.setText(JSON.stringify(body))
   }
   function askSummary() {
     if (root.queue.some(function(item) { return item.op === "summary" })) return
@@ -940,9 +946,12 @@ Panel {
     }
   }
 
-  Process {
-    id: enqueue
-    stdinEnabled: false
+  FileView {
+    id: commandFile
+    path: root.stateDir + "/command.json"
+    atomicWrites: true
+    watchChanges: false
+    printErrors: false
   }
 
   Process {
@@ -956,8 +965,25 @@ Panel {
     onTriggered: { root.copied = false; root.setupCopied = false }
   }
 
+  // Until the sidecar has created the state directory, poll for status.json without a watcher;
+  // the watched views below are built only once the directory exists, so their watchers arm.
   FileView {
-    path: root.stateDir + "/status.json"
+    id: statusProbe
+    path: root.sidecarSeen ? "" : root.stateDir + "/status.json"
+    watchChanges: false
+    printErrors: false
+    onLoaded: root.markSidecarSeen()
+  }
+
+  Timer {
+    interval: 2000
+    repeat: true
+    running: !root.sidecarSeen
+    onTriggered: statusProbe.reload()
+  }
+
+  FileView {
+    path: root.sidecarSeen ? root.stateDir + "/status.json" : ""
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
@@ -971,7 +997,7 @@ Panel {
   }
 
   FileView {
-    path: root.stateDir + "/response.json"
+    path: root.sidecarSeen ? root.stateDir + "/response.json" : ""
     watchChanges: true
     printErrors: false
     onFileChanged: reload()

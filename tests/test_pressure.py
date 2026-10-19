@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -399,7 +400,7 @@ class DemoTests(unittest.TestCase):
         from pressure.demo import seed
 
         store, _root = _store()
-        seed(store, datetime(2026, 10, 18, 16, 0, 0))
+        seed(store, datetime.now().replace(hour=16, minute=0, second=0))
         people = {person["alias"]: person for person in store.patients()}
         self.assertEqual(sorted(people), ["Alex", "Jordan", "Sam"])
         self.assertTrue(people["Sam"]["under_13"])
@@ -446,6 +447,151 @@ class IdentityTests(unittest.TestCase):
             text = (root / name).read_text(encoding="utf-8")
             self.assertIn(plugin_id, text, name)
             self.assertNotIn("jmcanana.pressure", text, name)
+
+
+class PanelPrivacyTests(unittest.TestCase):
+    # Every process the QML may start, by its exact literal argument list. Commands and personal
+    # data go through files in the private state directory, never through a command line.
+    ALLOWED_COMMANDS = {
+        '["sh", "-c", "wl-copy --type image/png < \\"$1\\"", "sh", root.sharePath]',
+        '["wl-copy", "--", root.setupText]',
+        '[root.pluginDir + "pressure/run", "--state", root.stateDir, "--data", root.dataDir]',
+    }
+    PROCESS_BLOCKS = 2
+
+    def violations(self, text: str) -> list[str]:
+        """Launch forms that are not one of the allowlisted literal command lines."""
+        found = []
+        for match in re.finditer(r"(?:\.command\s*=|\bcommand\s*:)\s*(\S)", text):
+            if match.group(1) != "[":
+                found.append("non-literal command: " + text[match.start():match.start() + 60])
+                continue
+            # The literal must end its statement, so it cannot be extended (".concat(...)").
+            literal = re.match(r"(\[[^\]]*\])[ \t]*(?:\n|;|\}|$)", text[match.start(1):])
+            if literal is None or literal.group(1) not in self.ALLOWED_COMMANDS:
+                found.append("unlisted command: " + text[match.start():match.start() + 60])
+        for launcher in (r"\.\s*exec\s*\(", r"execDetached", r"startDetached", r"property:\s*\"command\"", r"openUrlExternally"):
+            if re.search(launcher, text):
+                found.append("launcher: " + launcher)
+        return found
+
+    def test_only_allowlisted_processes_exist(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        sources = {qml: qml.read_text(encoding="utf-8") for qml in sorted(root.rglob("*.qml"))}
+        problems = [f"{qml.name}: {issue}" for qml, text in sources.items() for issue in self.violations(text)]
+        self.assertEqual(problems, [])
+        blocks = sum(len(re.findall(r"\bProcess\s*\{", text)) for text in sources.values())
+        self.assertEqual(blocks, self.PROCESS_BLOCKS)
+        panel = sources[root / "Panel.qml"]
+        self.assertIn("commandFile.setText(JSON.stringify(body))", panel)
+        self.assertIn('    body.id = root.sessionTag + "-" + root.commandId\n', panel)
+        # The two definitions the allowlisted command lines use, pinned exactly.
+        self.assertIn('  readonly property string sharePath: root.stateDir + "/pressure-share.png"\n', panel)
+        self.assertIn(
+            '  readonly property string setupText: "python3 -m venv ~/.local/share/jmcanana.blood-pressure/venv'
+            ' && ~/.local/share/jmcanana.blood-pressure/venv/bin/pip install \\"bleak==3.0.2\\""\n',
+            panel,
+        )
+        self.assertEqual(len(re.findall(r"property string (?:sharePath|setupText)\b", panel)), 2)
+
+    def test_the_scan_catches_every_form(self) -> None:
+        planted = [
+            'enqueue.command = ["python3", "e.py", JSON.stringify(body)]',
+            'Process { command: ["python3", "e.py", JSON.stringify(body)] }',
+            'Quickshell.execDetached(["python3", "e.py", JSON.stringify(body)])',
+            'clipboard.exec(["python3", "e.py", JSON.stringify(body)])',
+            'Process { command: root.writerArgs }',
+            'var argv = ["python3", JSON.stringify(body)]; clipboard.command = argv',
+            'Process { startDetached() }',
+            'clipboard.exec (["python3", JSON.stringify(body)])',
+            'clipboard.command = ["wl-copy", "--", root.setupText].concat([JSON.stringify(root.queue)])',
+            'Binding { target: clipboard; property: "command"; value: ["python3", JSON.stringify(body)] }',
+            'Qt.openUrlExternally("mailto:?body=" + root.summary.patient)',
+        ]
+        for text in planted:
+            self.assertTrue(self.violations(text), text)
+
+    def test_the_sidecar_claims_and_answers_a_command(self) -> None:
+        import asyncio
+
+        from pressure import sidecar
+
+        store, root = _store()
+        state = root / "state"
+        (state / "command.json").write_text(json.dumps({"op": "patients", "id": "7"}), encoding="utf-8")
+
+        async def run():
+            task = asyncio.create_task(sidecar._commands_clean(store, state, {}))
+            for _ in range(50):
+                await asyncio.sleep(0.05)
+                if (state / "response.json").exists():
+                    break
+            task.cancel()
+
+        asyncio.run(run())
+        self.assertEqual(json.loads((state / "response.json").read_text(encoding="utf-8"))["id"], "7")
+        self.assertFalse((state / "command.json").exists())
+        self.assertFalse((state / "command.claimed").exists())
+
+    def test_a_claim_left_by_a_crash_is_handled_first(self) -> None:
+        import asyncio
+
+        from pressure import sidecar
+
+        store, root = _store()
+        state = root / "state"
+        (state / "command.claimed").write_text(json.dumps({"op": "patients", "id": "left"}), encoding="utf-8")
+        state.chmod(0o755)
+
+        async def run():
+            task = asyncio.create_task(sidecar._commands_clean(store, state, {}))
+            for _ in range(50):
+                await asyncio.sleep(0.05)
+                if (state / "response.json").exists():
+                    break
+            task.cancel()
+
+        asyncio.run(run())
+        self.assertTrue((state / "response.json").exists())
+        self.assertEqual(json.loads((state / "response.json").read_text(encoding="utf-8"))["id"], "left")
+        self.assertFalse((state / "command.claimed").exists())
+        self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+
+    def test_a_command_written_while_one_is_handled_is_not_lost(self) -> None:
+        import asyncio
+        from unittest import mock
+
+        from pressure import sidecar
+
+        store, root = _store()
+        state = root / "state"
+        (state / "command.json").write_text(json.dumps({"op": "patients", "id": "1"}), encoding="utf-8")
+        handled: list[str] = []
+        real_handle = sidecar.handle
+        real_unlink = Path.unlink
+        planted = {"done": False}
+
+        def recording_handle(store_arg, command):
+            handled.append(str(command.get("id")))
+            return real_handle(store_arg, command)
+
+        def unlink_after_a_new_command(path, *args, **kwargs):
+            if not planted["done"]:
+                planted["done"] = True
+                (state / "command.json").write_text(json.dumps({"op": "patients", "id": "2"}), encoding="utf-8")
+            return real_unlink(path, *args, **kwargs)
+
+        async def run():
+            task = asyncio.create_task(sidecar._commands_clean(store, state, {}))
+            for _ in range(60):
+                await asyncio.sleep(0.05)
+                if len(handled) >= 2:
+                    break
+            task.cancel()
+
+        with mock.patch.object(sidecar, "handle", recording_handle), mock.patch.object(Path, "unlink", unlink_after_a_new_command):
+            asyncio.run(run())
+        self.assertEqual(handled, ["1", "2"])
 
 
 class DrainTests(unittest.TestCase):

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "jmcanana.blood-pressure",
   "name": "Blood Pressure",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "jmcanana",
   "license": "MIT",
   "description": "Your blood-pressure cuff, synced to your Omarchy desktop over Bluetooth LE. Readings stay on your computer. Not a medical device.",

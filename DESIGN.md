@@ -19,12 +19,12 @@ Measured on one UA-810CNBLE (advertises as UA-810BLE, firmware `PUA0810_1.01`) o
 
 ## Shape
 
-- `service` keeps a Python sidecar alive. `bar-widget` opens the panel. They share nothing but files under `~/.local/state/jmcanana.blood-pressure` and the database under `~/.local/share/jmcanana.blood-pressure`, both mode `0700` / `0600`.
+- `service` keeps a Python sidecar alive. `bar-widget` opens the panel. They share nothing but files under `~/.local/state/jmcanana.blood-pressure` and the database under `~/.local/share/jmcanana.blood-pressure`; both directories are `0700`, re-asserted by the sidecar. The database, status and response files are `0600`; the command file and the share image take the umask. The panel writes commands straight to a file (no process, so no command line carries a name) and waits for the sidecar's status file before the first one.
 - The sidecar is the only BlueZ client. Quickshell's Bluetooth type can pair a device and cannot read Blood Pressure Measurement.
 - A new monitor is not connected until the panel trusts it. The panel sees a name, a beacon class, and the last four hex digits. The full address stays in the database.
 - Readings bind to a patient by cuff user-id byte. The person shown on screen is a separate choice, so looking at one patient does not claim the next packet.
 - The bar never shows a number, a name, or a serial. It shows `BP`, `Sync`, or `New`. The theme urgent colour means AHA stage 2 or severe, ESC hypertension (from 140/90), any reading above the AHA crisis line (higher than 180 and/or 120, at any age), an irregular-pulse flag, or a sidecar error. AHA stage 1 and ESC elevated stay as the category word inside the panel. The colour follows the strongest stored reading, including ones not yet bound to a person. Changing who is on screen does not change it.
-- The panel is for a household at home: numbers and patient names show without a toggle. Readings, names and the share image stay on this computer (database 0600 in a 0700 directory) and never enter the repository; tests and mockups use synthetic numbers only.
+- The panel is for a household at home: numbers and patient names show without a toggle. Readings, names and the share image stay on this computer (in 0700 directories) and never enter the repository; tests and mockups use synthetic numbers only.
 - The panel (design direction B, "Map") draws only; `pressure/view.py` computes every position, so the bands it draws are the bands it classifies with:
   - the latest reading on the systolic-by-diastolic map (nested L regions, previous ten readings, crosshairs on the latest);
   - systolic, diastolic and pulse trends on equal-height band lanes over a day-slot time axis, each with a plain comparison sentence over the last 10 readings;

@@ -9,6 +9,7 @@ import argparse
 import importlib
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -19,7 +20,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from pressure.commands import handle, write_response
-from pressure.store import Store
+from pressure.store import Store, _private_dir
 
 
 def _dirs(args: argparse.Namespace) -> tuple[Path, Path]:
@@ -30,32 +31,37 @@ def _dirs(args: argparse.Namespace) -> tuple[Path, Path]:
 
 
 async def _commands_clean(store: Store, state: Path, live: dict) -> None:
+    """Handle the panel's command file. Claiming it with a rename first means a command written
+    while the previous one is being handled is never deleted unread."""
     command_path = state / "command.json"
+    claimed_path = state / "command.claimed"
     response_path = state / "response.json"
-    seen = None
     while True:
-        if command_path.exists():
-            stamp = command_path.stat().st_mtime_ns
-            if stamp != seen:
-                seen = stamp
-                command: dict = {}
-                try:
-                    command = json.loads(command_path.read_text(encoding="utf-8"))
-                    body = handle(store, command)
-                except ValueError as exc:
-                    body = {"ok": False, "error": str(exc)[:80]}
-                except Exception:
-                    body = {"ok": False, "error": "command failed"}
-                write_response(response_path, str(command.get("id", "")), body)
-                if command_path.exists() and command_path.stat().st_mtime_ns == stamp:
-                    command_path.unlink()
-                store.write_status(
-                    state=str(live.get("state", "idle")),
-                    beacon=str(live.get("beacon", "none")),
-                    link=bool(live.get("link", False)),
-                    error=str(live.get("error", "")),
-                )
-        await asyncio.sleep(0.2)
+        # Keep the directory 0700 even if something recreated it; a claim left by a crash is
+        # handled before any new command.
+        _private_dir(state)
+        if not claimed_path.exists():
+            try:
+                os.replace(command_path, claimed_path)
+            except FileNotFoundError:
+                await asyncio.sleep(0.2)
+                continue
+        command: dict = {}
+        try:
+            command = json.loads(claimed_path.read_text(encoding="utf-8"))
+            body = handle(store, command)
+        except ValueError as exc:
+            body = {"ok": False, "error": str(exc)[:80]}
+        except Exception:
+            body = {"ok": False, "error": "command failed"}
+        claimed_path.unlink(missing_ok=True)
+        write_response(response_path, str(command.get("id", "")), body)
+        store.write_status(
+            state=str(live.get("state", "idle")),
+            beacon=str(live.get("beacon", "none")),
+            link=bool(live.get("link", False)),
+            error=str(live.get("error", "")),
+        )
 
 
 async def serve(store: Store, state: Path) -> None:
