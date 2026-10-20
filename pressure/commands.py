@@ -87,9 +87,6 @@ def handle(store: Store, command: dict) -> dict:
             "events": store.telemetry_public(reveal_device),
             "devices": store.devices_public(reveal_device),
         }
-    if op == "set_clock":
-        store.put_setting("write_clock_next", "1" if command.get("enable", True) else "0")
-        return {"ok": True}
     return {"ok": False, "error": "unknown command"}
 
 

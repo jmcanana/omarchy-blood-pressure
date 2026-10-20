@@ -37,6 +37,38 @@ def clock_payload(moment: datetime) -> bytes:
     )
 
 
+NTP_CHECK_SECONDS = 1.0
+
+
+async def computer_clock_synced() -> bool:
+    """Whether systemd says this computer's clock is NTP-synchronized. Unknown counts as no, so an
+    unsynchronized computer never overwrites the cuff."""
+    try:
+        from dbus_fast import BusType, Message, MessageType
+        from dbus_fast.aio import MessageBus
+
+        async def ask() -> bool:
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                reply = await bus.call(
+                    Message(
+                        destination="org.freedesktop.timedate1",
+                        path="/org/freedesktop/timedate1",
+                        interface="org.freedesktop.DBus.Properties",
+                        member="Get",
+                        signature="ss",
+                        body=["org.freedesktop.timedate1", "NTPSynchronized"],
+                    )
+                )
+            finally:
+                bus.disconnect()
+            return reply.message_type == MessageType.METHOD_RETURN and reply.body[0].value is True
+
+        return await asyncio.wait_for(ask(), NTP_CHECK_SECONDS)
+    except Exception:
+        return False
+
+
 class _BleakLink:
     def __init__(self, client) -> None:
         self.client = client
@@ -128,6 +160,9 @@ async def radio_loop(store: Store, live: dict) -> None:
             kind = target.pop("kind", "transfer")
             live.update(state="connecting", beacon=kind)
             store.write_status(state="connecting", beacon=kind, link=False, error="")
+            clock_synced = await computer_clock_synced()
+            if not clock_synced:
+                store.add_telemetry(str(device.address), "computer-clock-unsynced", {})
             try:
                 await scanner.stop()
             except Exception as exc:
@@ -154,21 +189,16 @@ async def radio_loop(store: Store, live: dict) -> None:
                             state="scanning", beacon=kind, link=False, error="pairing timed out"
                         )
                     else:
-                        write_clock = store.setting("write_clock_next") == "1"
-                        payload = clock_payload(datetime.now().astimezone()) if write_clock else None
                         result = await drain(
                             link,
                             store,
                             str(device.address),
-                            write_clock=write_clock,
-                            clock_payload=payload,
+                            clock_source=(lambda: clock_payload(datetime.now().astimezone())) if clock_synced else None,
                         )
                         store.add_telemetry(
                             str(device.address), "drain", {"cuff_released": result["cuff_released"]}
                         )
                         store.record_sync(result["stored"])
-                        if result.get("clock_matched"):
-                            store.put_setting("clock_checked", "1")
                         store.update_device(
                             str(device.address),
                             name=device.name or "",

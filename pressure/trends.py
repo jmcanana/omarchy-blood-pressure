@@ -13,6 +13,8 @@ from statistics import median
 from pressure.categories import URGENT, categorise, crisis
 
 MINIMUM_SIDE = 4
+# time_source of a reading stamped while the cuff clock was more than two minutes off.
+CLOCK_OFF = "cuff-off"
 WIDER_THAN_MMHG = 10
 
 
@@ -35,9 +37,15 @@ def in_evening(hour: int | None) -> bool:
     return hour is not None and (hour >= 18 or hour <= 1)
 
 
+def clock_trusted(reading: dict) -> bool:
+    """False for a reading stamped by a cuff clock found off in the same sync: its hour is unreliable."""
+    return reading.get("time_source") != CLOCK_OFF
+
+
 def period_contrast(readings: list[dict], guideline: str) -> dict:
-    morning = [item for item in readings if in_morning(_hour(item.get("taken_at")))]
-    evening = [item for item in readings if in_evening(_hour(item.get("taken_at")))]
+    timed = [item for item in readings if clock_trusted(item)]
+    morning = [item for item in timed if in_morning(_hour(item.get("taken_at")))]
+    evening = [item for item in timed if in_evening(_hour(item.get("taken_at")))]
     ready = len(morning) >= MINIMUM_SIDE and len(evening) >= MINIMUM_SIDE
     result = {
         "ready": ready,

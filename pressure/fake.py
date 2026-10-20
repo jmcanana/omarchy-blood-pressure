@@ -77,7 +77,10 @@ class FakeLink:
         return b""
 
     async def write(self, uuid: str, payload: bytes) -> None:
+        """A written value reads back, as on the cuff's Current Time."""
         self.writes.append((uuid.lower(), payload))
+        self.events.append("write")
+        self.responses[uuid.lower()] = payload
 
 
 def measurement(

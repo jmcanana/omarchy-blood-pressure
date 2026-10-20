@@ -12,6 +12,7 @@ from datetime import date, datetime
 from statistics import median
 
 from pressure.categories import CHILD, TABLES, URGENT, categorise, crisis, label, pulse_band, side_band
+from pressure.trends import clock_trusted
 
 PULSE_LANES = {
     "lanes": [("below", 40, False), ("usual", 60, False), ("above", 100, True)],
@@ -261,9 +262,9 @@ def hero(readings: list[dict], guideline: str, today: date) -> dict:
 
 def hours(readings: list[dict], guideline: str) -> list[dict]:
     """The 24-hour dial: per hour, the lowest and highest systolic and diastolic, the count, and
-    whether any reading in that hour was stage 2 or above."""
+    whether any reading in that hour was stage 2 or above. Readings stamped by an off clock are left out."""
     buckets: list[dict] = [{"hour": hour, "n": 0, "urgent": False} for hour in range(24)]
-    for item in readings:
+    for item in filter(clock_trusted, readings):
         moment = _parse(item.get("taken_at"))
         systolic, diastolic = item.get("systolic"), item.get("diastolic")
         if moment is None or systolic is None or diastolic is None:

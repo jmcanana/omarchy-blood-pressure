@@ -15,7 +15,7 @@ from pathlib import Path
 from pressure.blp import mmhg, status_bits
 from pressure import view
 from pressure.categories import CHILD, reading_concern
-from pressure.trends import notices, period_contrast
+from pressure.trends import CLOCK_OFF, notices, period_contrast
 
 STATUS_KEYS = (
     "state",
@@ -363,14 +363,15 @@ class Store:
             public.append(item)
         return public
 
-    def add_reading(self, address: str, parsed: dict, source: str, received_at: str | None = None) -> bool:
+    def add_reading(self, address: str, parsed: dict, source: str, received_at: str | None = None) -> int | None:
+        """Returns the new row id, or None for a reading already stored."""
         raw = parsed["raw"]
         systolic, diastolic = mmhg(parsed)
         bits = status_bits(parsed.get("status"))
         user_byte = parsed.get("user_byte")
         patient_id = self.patient_for(address, user_byte)
         try:
-            self._db.execute(
+            cursor = self._db.execute(
                 """
                 INSERT INTO reading(
                     patient_id, address, user_byte, taken_at, time_source, received_at,
@@ -398,9 +399,17 @@ class Store:
         except sqlite3.IntegrityError:
             self.add_telemetry(address, "repeat", {"source": source})
             self._db.commit()
-            return False
+            return None
         self._db.commit()
-        return True
+        return cursor.lastrowid
+
+    def mark_clock_off(self, reading_ids: list[int]) -> None:
+        """These readings were stamped by a cuff clock found more than two minutes off."""
+        self._db.executemany(
+            "UPDATE reading SET time_source = ? WHERE id = ? AND time_source = 'cuff'",
+            [(CLOCK_OFF, reading_id) for reading_id in reading_ids],
+        )
+        self._db.commit()
 
     def add_telemetry(self, address: str | None, kind: str, body: dict) -> None:
         self._db.execute(
@@ -441,6 +450,10 @@ class Store:
         if self.setting("clock_checked") != "0" or not self.setting("clock_skew_seconds"):
             return None
         return round(int(self.setting("clock_skew_seconds")) / 60)
+
+    def _clock_unset(self) -> bool:
+        """The cuff reported a date that is not a date, so there is no offset to show."""
+        return self.setting("clock_checked") == "0" and not self.setting("clock_skew_seconds")
 
     def device_known(self, address: str) -> bool:
         """True once a model, a firmware string and the feature bits are stored for this monitor."""
@@ -513,6 +526,7 @@ class Store:
             "unassigned": self.count_unassigned(),
             "clock_checked": clock_known,
             "clock_skew_minutes": self._clock_skew_minutes(),
+            "clock_unset": self._clock_unset(),
             "last_sync": self.last_sync(),
         }
 

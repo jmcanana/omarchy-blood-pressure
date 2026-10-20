@@ -871,7 +871,7 @@ class DrainTests(unittest.TestCase):
 
         link, result = asyncio.run(run())
         self.assertEqual(result["stored"], 2)
-        self.assertFalse(result["clock_written"])
+        self.assertFalse(result["clock_set"])
         self.assertEqual(link.writes, [])
         self.assertIn("00002a35-0000-1000-8000-00805f9b34fb", link.subscribed)
         self.assertIn("11127003-b364-11e4-ab27-0800200c9a66", link.subscribed)
@@ -880,32 +880,6 @@ class DrainTests(unittest.TestCase):
         readings = store.readings_for(1)
         self.assertEqual([item["source"] for item in readings], ["standard", "vendor"])
         self.assertEqual(readings[1]["tail"], "0100000000")
-
-    def test_clock_write_is_explicit(self) -> None:
-        store, _root = _store()
-        address = "00:00:00:00:00:03"
-        payload = measurement(118, 76, (2024, 7, 1, 9, 0, 0), 60)
-
-        async def run():
-            link = FakeLink([("00002a35-0000-1000-8000-00805f9b34fb", payload)])
-            result = await drain(
-                link,
-                store,
-                address,
-                write_clock=True,
-                clock_payload=bytes(10),
-                quiet_seconds=0.12,
-                first_wait=1.0,
-            )
-            return link, result
-
-        import asyncio
-
-        link, result = asyncio.run(run())
-        self.assertTrue(result["clock_written"])
-        self.assertEqual(len(link.writes), 1)
-        self.assertIn("2a2b", link.writes[0][0])
-        self.assertTrue(all("11127001" not in uuid for uuid, _payload in link.writes))
 
     def test_drain_stays_quiet_after_subscribing(self) -> None:
         from pressure.blp import AND_VENDOR_INDICATE, AND_VENDOR_NOTIFY, AND_VENDOR_READ, BP_FEATURE, BP_MEASUREMENT
@@ -1026,6 +1000,7 @@ class DrainTests(unittest.TestCase):
             self.assertEqual(store.summary(None, "aha")["clock_skew_minutes"], None if expected == "1" else 60)
             self.assertEqual(link.writes, [])
 
+
     def test_unparsed_vendor_keeps_the_bytes_and_intermediate_is_not_a_row(self) -> None:
         from pressure.blp import AND_VENDOR_INDICATE, BP_INTERMEDIATE
 
@@ -1052,6 +1027,217 @@ class DrainTests(unittest.TestCase):
         unparsed = [item for item in revealed if item["kind"] == "unparsed"]
         self.assertEqual(unparsed[0]["body"]["raw"], raw.hex())
         self.assertTrue(all("raw" not in item["body"] for item in hidden))
+
+
+class ClockSetTests(unittest.TestCase):
+    """The cuff keeps its own clock and stamps each reading with it; it does not follow daylight saving."""
+
+    def drain_with_clock(self, offset, link_class=FakeLink, known=True):
+        import asyncio
+        from datetime import datetime
+
+        from pressure.blp import BP_MEASUREMENT, CURRENT_TIME
+        from pressure.radio import clock_payload
+
+        store, _root = _store()
+        address = "00:00:00:00:00:0b"
+        if known:
+            store.update_device(address, model="UA-810BLE", firmware="PUA0810_1.01", features=47)
+        records = [(BP_MEASUREMENT, measurement(118, 76, (2024, 7, day, 9, 0, 0), 60)) for day in (1, 2)]
+        sent: list[bytes] = []
+
+        def now_payload() -> bytes:
+            sent.append(clock_payload(datetime.now().astimezone()))
+            return sent[-1]
+
+        async def run():
+            link = link_class(
+                records,
+                uuids=[BP_MEASUREMENT],
+                responses={CURRENT_TIME: clock_payload(datetime.now().astimezone() + offset)},
+            )
+            result = await drain(link, store, address, quiet_seconds=0.6, first_wait=0.4, tail_after=0.2,
+                                 clock_source=now_payload)
+            return link, result
+
+        link, result = asyncio.run(run())
+        return store, link, result, sent
+
+    def test_an_hour_off_is_set_after_the_records_and_read_back(self) -> None:
+        from datetime import timedelta
+
+        from pressure.blp import CURRENT_TIME
+
+        store, link, result, sent = self.drain_with_clock(timedelta(hours=1))
+        self.assertTrue(result["clock_set"])
+        self.assertEqual(link.writes, [(CURRENT_TIME, sent[0])])
+        self.assertEqual(link.events, ["record", "record", "read", "read", "write", "read"])
+        self.assertEqual(result["stored"], 2)
+        self.assertEqual(store.setting("clock_checked"), "1")
+        self.assertIsNone(store.summary(None, "aha")["clock_skew_minutes"])
+
+    def test_readings_stamped_by_an_off_clock_leave_the_time_of_day_views(self) -> None:
+        """Setting the clock reopens the morning and evening comparison; the readings the wrong clock
+        stamped in that same sync must not enter it."""
+        from datetime import timedelta
+
+        from pressure.trends import period_contrast
+
+        for offset, source in ((timedelta(hours=1), "cuff-off"), (timedelta(0), "cuff")):
+            with self.subTest(offset=offset):
+                store, _link, _result, _sent = self.drain_with_clock(offset)
+                readings = store.readings_for(None)
+                self.assertEqual({item["time_source"] for item in readings}, {source})
+                shown = store.summary(None, "aha")
+                self.assertEqual(shown["n"], 2)
+                self.assertEqual(sum(bucket["n"] for bucket in shown["hours"]), 0 if source == "cuff-off" else 2)
+                self.assertEqual(period_contrast(readings, "aha")["morning_n"], 0 if source == "cuff-off" else 2)
+
+    def test_a_record_after_the_tail_began_is_marked_too(self) -> None:
+        import asyncio
+        from datetime import datetime, timedelta
+
+        from pressure.blp import BP_MEASUREMENT, CURRENT_TIME
+        from pressure.radio import clock_payload
+
+        store, _root = _store()
+        records = [(BP_MEASUREMENT, measurement(118, 76, (2024, 7, day, 9, 0, 0), 60)) for day in (1, 2)]
+
+        async def run():
+            link = FakeLink(records, uuids=[BP_MEASUREMENT], spacing=0.35,
+                            responses={CURRENT_TIME: clock_payload(datetime.now().astimezone() + timedelta(hours=1))})
+            await drain(link, store, "00:00:00:00:00:0d", quiet_seconds=0.6, first_wait=0.4, tail_after=0.2,
+                        clock_source=lambda: clock_payload(datetime.now().astimezone()))
+            return link
+
+        link = asyncio.run(run())
+        self.assertLess(link.events.index("write"), len(link.events) - 1 - link.events[::-1].index("record"))
+        self.assertEqual([item["time_source"] for item in store.readings_for(None)], ["cuff-off", "cuff-off"])
+
+    def test_an_unknown_clock_is_set_and_a_short_read_is_not(self) -> None:
+        import asyncio
+
+        from pressure.blp import BP_MEASUREMENT, CURRENT_TIME
+
+        record = measurement(118, 76, (2024, 7, 1, 9, 0, 0), 60)
+        payload = bytes(10)
+        for value, expect_write in ((bytes(10), True), (bytes([0, 0, 1, 1, 0, 0, 0, 1, 0, 1]), True), (b"\x00\x00", False)):
+            with self.subTest(value=value.hex()):
+                store, _root = _store()
+
+                async def run():
+                    link = FakeLink([(BP_MEASUREMENT, record)], uuids=[BP_MEASUREMENT], responses={CURRENT_TIME: value})
+                    await drain(link, store, "00:00:00:00:00:0c", quiet_seconds=0.6, first_wait=0.4, tail_after=0.2,
+                                clock_source=lambda: payload)
+                    return link
+
+                link = asyncio.run(run())
+                self.assertEqual(bool(link.writes), expect_write)
+                kinds = [event["kind"] for event in store.telemetry_public(True)]
+                self.assertEqual("clock-unknown" in kinds, expect_write)
+                self.assertEqual(store.summary(None, "aha")["clock_unset"], expect_write)
+
+    def test_a_matching_clock_is_left_alone(self) -> None:
+        from datetime import timedelta
+
+        for offset in (timedelta(0), timedelta(seconds=90), timedelta(seconds=-90)):
+            with self.subTest(offset=offset):
+                _store_, link, result, _sent = self.drain_with_clock(offset)
+                self.assertEqual(link.writes, [])
+                self.assertFalse(result["clock_set"])
+
+    def test_the_clock_goes_before_the_identity_reads(self) -> None:
+        from datetime import timedelta
+
+        from pressure.blp import BATTERY, CURRENT_TIME
+
+        _store_, link, result, _sent = self.drain_with_clock(timedelta(minutes=-5), known=False)
+        self.assertTrue(result["clock_set"])
+        self.assertEqual(link.reads[:3], [BATTERY, CURRENT_TIME, CURRENT_TIME])
+        self.assertEqual(link.events.index("write"), 4)
+        self.assertIn("00002a24-0000-1000-8000-00805f9b34fb", link.reads[3:])
+
+    def test_a_refused_or_ignored_write_is_reported_and_the_drain_goes_on(self) -> None:
+        from datetime import timedelta
+
+        class Refuses(FakeLink):
+            async def write(self, uuid: str, payload: bytes) -> None:
+                raise RuntimeError("write not permitted")
+
+        class Ignores(FakeLink):
+            async def write(self, uuid: str, payload: bytes) -> None:
+                self.writes.append((uuid.lower(), payload))
+
+        class ReadbackFails(FakeLink):
+            async def read(self, uuid: str) -> bytes:
+                if self.writes and uuid.lower().startswith("00002a2b"):
+                    raise RuntimeError("link dropped after the write")
+                return await super().read(uuid)
+
+        cases = ((Refuses, "clock-write-failed"), (Ignores, "clock-write"), (ReadbackFails, "clock-readback-failed"))
+        for link_class, telemetry in cases:
+            with self.subTest(link=link_class.__name__):
+                store, link, result, _sent = self.drain_with_clock(timedelta(hours=1), link_class, known=False)
+                self.assertFalse(result["clock_set"])
+                self.assertEqual(result["stored"], 2)
+                self.assertEqual(store.setting("clock_checked"), "0")
+                self.assertEqual(store.summary(None, "aha")["clock_skew_minutes"], 60)
+                self.assertIn("00002a24-0000-1000-8000-00805f9b34fb", link.reads)
+                kinds = [event["kind"] for event in store.telemetry_public(True)]
+                self.assertIn(telemetry, kinds)
+
+
+class ComputerClockTests(unittest.TestCase):
+    """An unsynchronized computer must never overwrite a correct cuff."""
+
+    def ask(self, value=True, hang=False, missing=False) -> bool:
+        import asyncio
+        import enum
+        import sys
+        import types
+        from unittest import mock
+
+        from pressure import radio
+
+        class MessageType(enum.Enum):
+            METHOD_RETURN = 2
+            ERROR = 3
+
+        class Message:
+            def __init__(self, **fields) -> None:
+                self.fields = fields
+
+        class Bus:
+            def __init__(self, bus_type=None) -> None:
+                self.bus_type = bus_type
+
+            async def connect(self):
+                return self
+
+            async def call(self, message):
+                if hang:
+                    await asyncio.sleep(30)
+                variant = types.SimpleNamespace(value=value)
+                return types.SimpleNamespace(message_type=MessageType.METHOD_RETURN, body=[variant])
+
+            def disconnect(self) -> None:
+                return None
+
+        package = types.ModuleType("dbus_fast")
+        package.BusType = types.SimpleNamespace(SYSTEM="system")
+        package.Message = Message
+        package.MessageType = MessageType
+        aio = types.ModuleType("dbus_fast.aio")
+        aio.MessageBus = Bus
+        modules = {"dbus_fast": None, "dbus_fast.aio": None} if missing else {"dbus_fast": package, "dbus_fast.aio": aio}
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(radio, "NTP_CHECK_SECONDS", 0.2):
+            return asyncio.run(radio.computer_clock_synced())
+
+    def test_only_a_synchronized_clock_counts(self) -> None:
+        self.assertTrue(self.ask(True))
+        self.assertFalse(self.ask(False))
+        self.assertFalse(self.ask(hang=True))
+        self.assertFalse(self.ask(missing=True))
 
 
 class ReviewTests(unittest.TestCase):

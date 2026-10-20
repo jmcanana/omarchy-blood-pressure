@@ -193,7 +193,7 @@ def self_check(data: Path, state: Path) -> None:
         )
         result = await drain(link, store, address, quiet_seconds=0.15, first_wait=1.0)
         arrived = result["stored"] + result["repeated"]
-        if arrived != 2 or result["clock_written"]:
+        if arrived != 2 or result["clock_set"]:
             raise SystemExit("self-check drain mismatch")
 
     asyncio.run(run())

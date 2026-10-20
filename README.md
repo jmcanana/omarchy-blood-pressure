@@ -57,7 +57,7 @@ flowchart LR
 ```
 
 - **Connect only while the light flashes.** The cuff advertises a connectable packet only in that window. The sidecar ignores its other beacons: the START burst and the idle iBeacon.
-- **Stay quiet while it sends.** The sidecar subscribes and then sends nothing until the records stop; requests between records made the cuff stop early. After that it reads the battery and checks the cuff clock, which it never writes.
+- **Stay quiet while it sends.** The sidecar subscribes and then sends nothing until the records stop; requests between records made the cuff stop early. After that it reads the battery and the cuff clock, and sets the clock from this computer when it is more than two minutes off, such as after a daylight-saving change.
 - **Compute in Python, draw in QML.** `pressure/view.py` computes every position, so the panel draws exactly the bands it classifies with.
 
 [`DESIGN.md`](DESIGN.md) records what the cuff actually does on the air, with the evidence.

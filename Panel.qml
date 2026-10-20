@@ -856,6 +856,8 @@ Panel {
                     var counts = "morning " + (c.morning_n || 0) + ", evening " + (c.evening_n || 0)
                     if (root.summary.clock_skew_minutes !== null && root.summary.clock_skew_minutes !== undefined)
                       return "Not compared: the cuff clock was about " + root.summary.clock_skew_minutes + " minutes off at the last sync. Readings so far: " + counts + "."
+                    if (root.summary.clock_unset)
+                      return "Not compared: the cuff clock was not set at the last sync. Readings so far: " + counts + "."
                     if (!root.summary.clock_checked)
                       return "Not compared yet: the cuff clock has not been checked against this computer. Readings so far: " + counts + "."
                     if (!c.ready)
@@ -898,8 +900,9 @@ Panel {
               Text {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                readonly property bool off: root.summary.clock_skew_minutes !== null && root.summary.clock_skew_minutes !== undefined
-                text: off ? "Clock " + root.summary.clock_skew_minutes + " min off" : (root.summary.clock_checked ? "Clock checked" : "Clock not checked")
+                readonly property bool skewed: root.summary.clock_skew_minutes !== null && root.summary.clock_skew_minutes !== undefined
+                readonly property bool off: skewed || root.summary.clock_unset === true
+                text: skewed ? "Clock " + root.summary.clock_skew_minutes + " min off" : (off ? "Clock not set" : (root.summary.clock_checked ? "Clock checked" : "Clock not checked"))
                 color: off ? root.ink : root.ink2
                 font.family: root.family
                 font.pixelSize: Style.font.caption
@@ -907,10 +910,10 @@ Panel {
               }
             }
             Text {
-              visible: root.summary.clock_skew_minutes !== null && root.summary.clock_skew_minutes !== undefined
+              visible: root.summary.clock_unset === true || (root.summary.clock_skew_minutes !== null && root.summary.clock_skew_minutes !== undefined)
               width: parent.width
               wrapMode: Text.WordWrap
-              text: "Set the cuff's clock from its own menu; the next sync checks it again."
+              text: "The next sync sets the cuff's clock from this computer. If it stays off, set it from the cuff's own menu."
               color: root.ink2
               font.family: root.family
               font.pixelSize: Style.font.caption
