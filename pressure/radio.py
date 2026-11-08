@@ -38,35 +38,82 @@ def clock_payload(moment: datetime) -> bytes:
 
 
 NTP_CHECK_SECONDS = 1.0
+ADAPTER_CHECK_SECONDS = 2.0
+SCAN_CHECK_SECONDS = 10.0
+ADAPTER_PATH = "/org/bluez/hci0"
+
+
+class ScanLost(RuntimeError):
+    """The scan ended underneath the sidecar. Raised so the sidecar exits and Service.qml starts a
+    fresh one: bleak 3.0.2 does not notice a bluetoothd restart or an adapter power cycle."""
+
+
+async def system_properties(destination: str, path: str, interface: str, timeout: float) -> dict | None:
+    """All properties of one system-bus object, or None when it cannot be read in time."""
+    try:
+        from dbus_fast import BusType, Message, MessageType
+        from dbus_fast.aio import MessageBus
+
+        async def ask() -> dict | None:
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                reply = await bus.call(
+                    Message(
+                        destination=destination,
+                        path=path,
+                        interface="org.freedesktop.DBus.Properties",
+                        member="GetAll",
+                        signature="s",
+                        body=[interface],
+                    )
+                )
+            finally:
+                bus.disconnect()
+            if reply.message_type != MessageType.METHOD_RETURN:
+                return None
+            return {name: variant.value for name, variant in reply.body[0].items()}
+
+        return await asyncio.wait_for(ask(), timeout)
+    except Exception:
+        return None
 
 
 async def computer_clock_synced() -> bool:
     """Whether systemd says this computer's clock is NTP-synchronized. Unknown counts as no, so an
     unsynchronized computer never overwrites the cuff."""
+    properties = await system_properties(
+        "org.freedesktop.timedate1", "/org/freedesktop/timedate1", "org.freedesktop.timedate1", NTP_CHECK_SECONDS
+    )
+    return (properties or {}).get("NTPSynchronized") is True
+
+
+async def adapter_state() -> dict | None:
+    return await system_properties("org.bluez", ADAPTER_PATH, "org.bluez.Adapter1", ADAPTER_CHECK_SECONDS)
+
+
+def adapter_ready(adapter: dict | None) -> bool:
+    """bluetoothd answers and the adapter is powered, so a scan can start."""
+    return (adapter or {}).get("Powered") is True
+
+
+def scan_lost(adapter: dict | None) -> bool:
+    """The adapter is up but nobody is discovering, so our scan has ended. While bluetoothd is down
+    or the adapter is off, a fresh sidecar could not scan either, so that is not a loss yet. Another
+    client's discovery (the Bluetooth panel, say) hides a loss until it stops."""
+    return adapter_ready(adapter) and (adapter or {}).get("Discovering") is False
+
+
+async def wait_for_adapter() -> None:
+    while not adapter_ready(await adapter_state()):
+        await asyncio.sleep(SCAN_CHECK_SECONDS)
+
+
+async def woken_within(wake: asyncio.Event, seconds: float) -> bool:
     try:
-        from dbus_fast import BusType, Message, MessageType
-        from dbus_fast.aio import MessageBus
-
-        async def ask() -> bool:
-            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            try:
-                reply = await bus.call(
-                    Message(
-                        destination="org.freedesktop.timedate1",
-                        path="/org/freedesktop/timedate1",
-                        interface="org.freedesktop.DBus.Properties",
-                        member="Get",
-                        signature="ss",
-                        body=["org.freedesktop.timedate1", "NTPSynchronized"],
-                    )
-                )
-            finally:
-                bus.disconnect()
-            return reply.message_type == MessageType.METHOD_RETURN and reply.body[0].value is True
-
-        return await asyncio.wait_for(ask(), NTP_CHECK_SECONDS)
-    except Exception:
+        await asyncio.wait_for(wake.wait(), seconds)
+    except TimeoutError:
         return False
+    return True
 
 
 class _BleakLink:
@@ -146,13 +193,19 @@ async def radio_loop(store: Store, live: dict) -> None:
         live["beacon"] = kind
         wake.set()
 
+    await wait_for_adapter()
     scanner = BleakScanner(detection_callback=on_detect)
     await scanner.start()
     live["state"] = "scanning"
     store.write_status(state="scanning", beacon="none", link=False, error="")
     try:
         while True:
-            await wake.wait()
+            if not await woken_within(wake, SCAN_CHECK_SECONDS):
+                adapter = await adapter_state()
+                if scan_lost(adapter):
+                    store.add_telemetry(None, "scan-lost", {"powered": True, "discovering": False})
+                    raise ScanLost("BlueZ is no longer discovering")
+                continue
             wake.clear()
             if "device" not in target:
                 continue
@@ -231,7 +284,8 @@ async def radio_loop(store: Store, live: dict) -> None:
                 except Exception:
                     live["state"] = "error"
                     store.write_status(state="error", beacon="none", link=False, error="scan did not resume")
-                    return
+                    store.add_telemetry(None, "scan-lost", {"resume_failed": True})
+                    raise ScanLost("scan did not resume after a sync") from None
     finally:
         try:
             await scanner.stop()

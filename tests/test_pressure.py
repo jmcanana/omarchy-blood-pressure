@@ -255,6 +255,135 @@ class ClockTests(unittest.TestCase):
             asyncio.run(_BleakLink(Client(RuntimeError("Authentication Failed"))).pair())
 
 
+class WatchdogTests(unittest.TestCase):
+    """The sidecar must exit, so Service.qml starts a fresh one, when its scan ends underneath it."""
+
+    UP = {"Powered": True, "Discovering": True}
+    LOST = {"Powered": True, "Discovering": False}
+    OFF = {"Powered": False, "Discovering": False}
+
+    def run_radio(self, states: list, seconds: float = 0.5, fail_resume: bool = False, trigger=None):
+        import asyncio
+        import types
+        from unittest import mock
+
+        import pressure.radio as radio
+
+        store, _root = _store()
+        log: list[str] = []
+        asked = {"count": 0}
+
+        class Scanner:
+            def __init__(self, detection_callback) -> None:
+                self.callback = detection_callback
+
+            async def start(self) -> None:
+                if fail_resume and "start" in log:
+                    raise RuntimeError("org.bluez.Error.NotReady")
+                log.append("start")
+                if trigger:
+                    trigger(self.callback, store)
+
+            async def stop(self) -> None:
+                log.append("stop")
+
+        class Client:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                raise RuntimeError("le-connection-abort-by-local")
+
+            async def __aexit__(self, *_exc) -> None:
+                return None
+
+        async def states_in_order():
+            asked["count"] += 1
+            log.append("ask")
+            return states[min(asked["count"], len(states)) - 1]
+
+        async def unsynced() -> bool:
+            return False
+
+        bleak = types.ModuleType("bleak")
+        bleak.BleakScanner = Scanner
+        bleak.BleakClient = Client
+        with (
+            mock.patch.dict("sys.modules", {"bleak": bleak}),
+            mock.patch.object(radio, "adapter_state", states_in_order),
+            mock.patch.object(radio, "computer_clock_synced", unsynced),
+            mock.patch.object(radio, "SCAN_CHECK_SECONDS", 0.01),
+        ):
+            try:
+                asyncio.run(asyncio.wait_for(radio.radio_loop(store, {}), seconds))
+            except TimeoutError:
+                return "kept-scanning", log, store
+            except radio.ScanLost:
+                return "lost", log, store
+        return "returned", log, store
+
+    def test_verdicts(self) -> None:
+        from pressure.radio import adapter_ready, scan_lost
+
+        self.assertTrue(scan_lost(self.LOST))
+        for adapter in (None, {}, self.UP, self.OFF, {"Powered": True}):
+            self.assertFalse(scan_lost(adapter), adapter)
+        self.assertTrue(adapter_ready(self.UP) and adapter_ready(self.LOST))
+        self.assertFalse(adapter_ready(None) or adapter_ready(self.OFF))
+
+    def test_a_lost_scan_ends_the_radio_with_telemetry(self) -> None:
+        result, log, store = self.run_radio([self.UP, self.UP, self.UP, self.LOST])
+        self.assertEqual(result, "lost")
+        self.assertEqual(log.count("start"), 1)
+        self.assertIn("scan-lost", [row["kind"] for row in store.telemetry_public(False)])
+
+    def test_a_healthy_or_unavailable_adapter_keeps_waiting(self) -> None:
+        for later in (self.UP, self.OFF, None):
+            result, log, _store_ = self.run_radio([self.UP, later], seconds=0.2)
+            self.assertEqual(result, "kept-scanning", later)
+            self.assertGreater(log.count("ask"), 3)
+
+    def test_the_scan_starts_only_once_the_adapter_is_powered(self) -> None:
+        result, log, _store_ = self.run_radio([None, self.OFF, self.UP], seconds=0.2)
+        self.assertEqual(result, "kept-scanning")
+        self.assertEqual(log[:4], ["ask", "ask", "ask", "start"])
+
+    def test_a_scan_that_will_not_resume_after_a_sync_ends_the_radio(self) -> None:
+        address = "aa:bb:cc:dd:ee:01"
+        window = {105: bytes.fromhex("020501640080"), 76: bytes.fromhex("001122334455a1030001c3")}
+
+        def transfer_window(callback, store) -> None:
+            store.trust(address, "Synthetic")
+            device = type("Device", (), {"address": address, "name": "UA-810BLE"})()
+            advert = type("Advert", (), {"manufacturer_data": window, "service_uuids": [], "local_name": ""})()
+            callback(device, advert)
+
+        result, log, store = self.run_radio([self.UP], seconds=3.0, fail_resume=True, trigger=transfer_window)
+        self.assertEqual(result, "lost")
+        kinds = [row["kind"] for row in store.telemetry_public(False)]
+        self.assertIn("connect-end", kinds)
+        self.assertIn("scan-lost", kinds)
+
+    def test_a_radio_failure_ends_the_sidecar(self) -> None:
+        import asyncio
+        from unittest import mock
+
+        import pressure.sidecar as sidecar
+        from pressure.radio import ScanLost
+
+        async def lost(*_args) -> None:
+            raise ScanLost("test")
+
+        async def forever(*_args) -> None:
+            await asyncio.Event().wait()
+
+        store, root = _store()
+        with mock.patch.object(sidecar, "_radio", lost), mock.patch.object(sidecar, "_commands_clean", forever):
+            with self.assertRaises(Exception) as caught:
+                asyncio.run(asyncio.wait_for(sidecar.serve(store, root / "state"), 2.0))
+        self.assertTrue(any(isinstance(item, ScanLost) for item in getattr(caught.exception, "exceptions", [])))
+
+
 class TrendTests(unittest.TestCase):
     def test_contrast_waits_for_four_on_each_side(self) -> None:
         few = [{"taken_at": "2024-01-01T07:00:00", "systolic": 150, "diastolic": 95, "irregular": False}]
@@ -1217,8 +1346,11 @@ class ComputerClockTests(unittest.TestCase):
             async def call(self, message):
                 if hang:
                     await asyncio.sleep(30)
+                assert message.fields["member"] == "GetAll"
                 variant = types.SimpleNamespace(value=value)
-                return types.SimpleNamespace(message_type=MessageType.METHOD_RETURN, body=[variant])
+                return types.SimpleNamespace(
+                    message_type=MessageType.METHOD_RETURN, body=[{"NTPSynchronized": variant}]
+                )
 
             def disconnect(self) -> None:
                 return None
