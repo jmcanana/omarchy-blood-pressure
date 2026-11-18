@@ -43,7 +43,7 @@ Item {
     onRunningChanged: {
       if (sync.running) root.startedAt = Date.now()
     }
-    onExited: function(exitCode, exitStatus) {
+    onExited: function(exitCode) {
       restart.interval = root.nextDelay(exitCode, Date.now() - root.startedAt)
       restart.restart()
     }
