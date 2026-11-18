@@ -223,6 +223,17 @@ def self_check(data: Path, state: Path) -> None:
     print("SELF_CHECK_OK", flush=True)
 
 
+def _scan_lost_in(failure: BaseException) -> ScanLost | None:
+    """The ScanLost in a failure, or in any exception group nested inside it."""
+    if isinstance(failure, ScanLost):
+        return failure
+    for inner in getattr(failure, "exceptions", ()):
+        found = _scan_lost_in(inner)
+        if found is not None:
+            return found
+    return None
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Local blood-pressure sync")
     parser.add_argument("--data")
@@ -237,8 +248,12 @@ def main(argv: list[str] | None = None) -> None:
         return
     try:
         asyncio.run(_run_until_stopped(supervise(data, state), args.parent_pid))
-    except* ScanLost as lost:
-        print(f"scan lost, exiting for a restart: {lost.exceptions[0]}", file=sys.stderr, flush=True)
+    except Exception as failure:
+        lost = _scan_lost_in(failure)
+        if lost is None:
+            raise
+        # A lost scan wins over anything that failed beside it, so Service.qml restarts in 4 s.
+        print(f"scan lost, exiting for a restart: {lost}", file=sys.stderr, flush=True)
         sys.exit(SCAN_LOST_EXIT)
 
 

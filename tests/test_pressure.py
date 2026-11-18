@@ -1564,6 +1564,38 @@ class QuietScanTests(unittest.TestCase):
         service = (Path(__file__).resolve().parent.parent / "Service.qml").read_text(encoding="utf-8")
         self.assertIn(f"readonly property int scanLostExit: {sidecar.SCAN_LOST_EXIT}\n", service)
 
+    def test_a_lost_scan_beside_another_failure_still_exits_three(self) -> None:
+        from unittest import mock
+
+        from pressure import sidecar
+        from pressure.radio import ScanLost
+
+        async def both(*_args) -> None:
+            raise ExceptionGroup("tasks", [ValueError("command"), ExceptionGroup("radio", [ScanLost("lost")])])
+
+        async def other(*_args) -> None:
+            raise ExceptionGroup("tasks", [ValueError("command")])
+
+        with mock.patch.object(sidecar, "supervise", both), self.assertRaises(SystemExit) as caught:
+            sidecar.main(["--data", tempfile.mkdtemp(), "--state", tempfile.mkdtemp()])
+        self.assertEqual(caught.exception.code, sidecar.SCAN_LOST_EXIT)
+        with mock.patch.object(sidecar, "supervise", other), self.assertRaises(ExceptionGroup):
+            sidecar.main(["--data", tempfile.mkdtemp(), "--state", tempfile.mkdtemp()])
+
+    def test_run_ignores_a_relative_xdg_value(self) -> None:
+        home = Path(tempfile.mkdtemp())
+        data = home / ".local" / "share" / "jmcanana.blood-pressure"
+        python = data / "venv" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.write_text('#!/bin/bash\ncase "$2" in *print*) echo 3.10 ;; *) exit 1 ;; esac\n', encoding="utf-8")
+        python.chmod(0o755)
+        env = dict(os.environ, HOME=str(home), XDG_DATA_HOME="relative/data", XDG_STATE_HOME="relative/state")
+        run = Path(__file__).resolve().parent.parent / "pressure" / "run"
+        result = subprocess.run([str(run)], capture_output=True, text=True, timeout=20, env=env, cwd=str(home))
+        self.assertEqual(result.returncode, 4)
+        self.assertTrue((home / ".local" / "state" / "jmcanana.blood-pressure" / "status.json").exists())
+        self.assertFalse((home / "relative").exists())
+
 
 class FakeRegistrar:
     """Stands in for BluezRegistrar: records calls, and refuses a label on request."""
@@ -1633,6 +1665,7 @@ class ShadowTests(unittest.TestCase):
         found, _released = registrar.callbacks["company"]
         found("company", self.CUFF_PATH)
         found("company", "/org/bluez/hci0/dev_11_22_33_44_55_66")
+        found("company", "/org/bluez/hci0/dev_11_22_33_44_55_66")
         found("ibeacon", "/org/bluez/hci0/dev_11_22_33_44_55_66")
         rows = store.telemetry_public(True)
         seen = [row for row in rows if row["kind"] == "monitor-seen"]
@@ -1656,27 +1689,47 @@ class ShadowTests(unittest.TestCase):
         asyncio.run(shadow.tick())
         self.assertEqual(log.count("arm:company"), 1)
 
-    def test_it_rearms_every_two_minutes_and_after_a_release(self) -> None:
+    def test_it_rearms_only_after_a_release(self) -> None:
         import asyncio
 
         from pressure.shadow import REARM_SECONDS
 
         shadow, store, registrar, log, now = self.make()
         asyncio.run(shadow.arm())
-        now["t"] += REARM_SECONDS - 1
+        now["t"] += REARM_SECONDS * 5
         asyncio.run(shadow.tick())
         self.assertEqual(log.count("arm:company"), 1)
-        now["t"] += 1
-        asyncio.run(shadow.tick())
-        self.assertEqual(log.count("arm:company"), 2)
-        self.assertIn("disarm:company", log)
         _found, released = registrar.callbacks["tail"]
         released("tail")
         self.assertNotIn("tail", shadow.handles)
         self.assertIn("monitor-released", self.kinds(store))
-        now["t"] += REARM_SECONDS
         asyncio.run(shadow.tick())
-        self.assertEqual(log.count("arm:tail"), 3)
+        self.assertEqual(log.count("arm:tail"), 2)
+        self.assertEqual(set(shadow.handles), {"company", "tail", "ibeacon"})
+
+    def test_every_advert_is_counted_and_one_row_is_stored_per_episode(self) -> None:
+        import asyncio
+
+        from pressure.shadow import EPISODE_SECONDS
+
+        shadow, store, registrar, _log, now = self.make()
+        asyncio.run(shadow.arm())
+        found, _released = registrar.callbacks["company"]
+        for _ in range(40):
+            found("company", self.CUFF_PATH)
+        now["t"] += EPISODE_SECONDS - 1
+        found("company", self.CUFF_PATH)
+        seen = [row for row in store.telemetry_public(True) if row["kind"] == "monitor-seen"]
+        self.assertEqual(len(seen), 1)
+        now["t"] += 1
+        found("company", self.CUFF_PATH)
+        seen = [row for row in store.telemetry_public(True) if row["kind"] == "monitor-seen"]
+        self.assertEqual(len(seen), 2)
+        asyncio.run(shadow.disarm())
+        reports = [row["body"] for row in store.telemetry_public(True) if row["kind"] == "monitor-reports"]
+        self.assertEqual(reports, [{"monitor": "company", "reports": 42}])
+        asyncio.run(shadow.disarm())
+        self.assertEqual(len([row for row in store.telemetry_public(True) if row["kind"] == "monitor-reports"]), 1)
 
     def test_the_apple_shape_is_noted_once_per_run(self) -> None:
         shadow, store, _registrar, _log, _now = self.make()
@@ -1685,12 +1738,12 @@ class ShadowTests(unittest.TestCase):
         shapes = [row["body"] for row in store.telemetry_public(True) if row["kind"] == "apple-shape"]
         self.assertEqual(shapes, [{"length": 23}])
 
-    def test_the_mode_file_chooses_and_defaults_to_shadow(self) -> None:
+    def test_the_mode_file_chooses_and_defaults_to_active(self) -> None:
         from pressure.shadow import scan_mode
 
         state = Path(tempfile.mkdtemp())
-        self.assertEqual(scan_mode(state), "shadow")
-        for written, expected in (("active\n", "active"), ("shadow", "shadow"), ("passive", "shadow"), ("", "shadow")):
+        self.assertEqual(scan_mode(state), "active")
+        for written, expected in (("shadow\n", "shadow"), ("active", "active"), ("passive", "active"), ("", "active")):
             (state / "scan-mode").write_text(written, encoding="utf-8")
             self.assertEqual(scan_mode(state), expected, written)
 
@@ -1721,7 +1774,7 @@ class ShadowTests(unittest.TestCase):
         self.assertIn("connect-end", kinds)
         self.assertIn("apple-shape", kinds)
 
-    def test_the_sidecar_runs_the_shadow_unless_the_mode_file_says_active(self) -> None:
+    def test_the_sidecar_runs_the_shadow_only_when_the_mode_file_says_shadow(self) -> None:
         import asyncio
         import types
         from unittest import mock
@@ -1734,7 +1787,7 @@ class ShadowTests(unittest.TestCase):
         async def loop(store, live, shadow=None) -> None:
             seen.append(shadow)
 
-        for mode, expect_shadow in (("", True), ("active", False)):
+        for mode, expect_shadow in (("", False), ("active", False), ("shadow", True)):
             store, root = _store()
             if mode:
                 (store.state_dir / "scan-mode").write_text(mode, encoding="utf-8")

@@ -41,7 +41,18 @@ Item {
     command: [root.pluginDir + "pressure/run", "--state", root.stateDir, "--data", root.dataDir]
     running: true
     onRunningChanged: {
-      if (sync.running) root.startedAt = Date.now()
+      if (sync.running) {
+        root.startedAt = Date.now()
+        return
+      }
+      // A process that never started may give no exited signal: retry it once the event that stopped
+      // it has been handled, unless onExited has already scheduled the restart.
+      Qt.callLater(function() {
+        if (!sync.running && !restart.running) {
+          restart.interval = root.nextDelay(-1, Date.now() - root.startedAt)
+          restart.restart()
+        }
+      })
     }
     onExited: function(exitCode) {
       restart.interval = root.nextDelay(exitCode, Date.now() - root.startedAt)

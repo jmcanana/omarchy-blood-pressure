@@ -1,9 +1,16 @@
 """Shadow listeners: BlueZ advertisement monitors beside the active scan, recording what a passive scan
 would have heard, so passive scanning can be proved on real measurements before it replaces the scan.
 
-They change nothing in the sync. They are removed before each connect and registered again after it,
-every BlueZ call is bounded, and any failure turns the shadow off for this run and is recorded.
-Only a trusted cuff's matches are stored with its address; other devices are counted, never named.
+An opt-in trial ("shadow" in the state directory's scan-mode file; the default is "active"). The connect
+path is unchanged: the monitors are removed before each connect and registered again after it, every
+BlueZ call is bounded, and any failure turns the shadow off for this run and is recorded. The scan is
+not unchanged: while any monitor exists the kernel turns off the controller's duplicate filter for
+active discovery (Linux 7.2 hci_sync.c, hci_active_scan_sync), so bluetoothd sees every advert of every
+device in range, and the shell log may grow faster during the trial. Watch it.
+
+BlueZ 5.87 calls DeviceFound on every matching advert for a monitor without RSSI thresholds, so a
+trusted cuff's match is stored once per episode (EPISODE_SECONDS) per monitor, with the reports counted
+and written when the monitors are removed. Other devices are counted as distinct devices, never named.
 
 Patterns (an or-pattern matches its bytes at a fixed offset inside one AD structure's data):
 - company: the A&D company id 105 (0x0069, little-endian) at the start of manufacturer data. The START
@@ -33,19 +40,20 @@ PATTERNS: dict[str, tuple[int, int, bytes]] = {
     "ibeacon": (0, MANUFACTURER_DATA, bytes.fromhex("4c000215")),
 }
 REARM_SECONDS = 120.0
+EPISODE_SECONDS = 300.0
 BLUEZ_CALL_SECONDS = 1.0
 OTHERS_REPORT_SECONDS = 3600.0
 MODE_FILE = "scan-mode"
-MODES = ("shadow", "active")
+MODES = ("active", "shadow")
 
 
 def scan_mode(state_dir: Path) -> str:
-    """The scan mode from the state directory's scan-mode file: shadow unless it says active."""
+    """The scan mode from the state directory's scan-mode file: active unless it says shadow."""
     try:
         chosen = (Path(state_dir) / MODE_FILE).read_text(encoding="utf-8").strip()
     except OSError:
-        return "shadow"
-    return chosen if chosen in MODES else "shadow"
+        return "active"
+    return chosen if chosen in MODES else "active"
 
 
 def address_from_path(path: str) -> str:
@@ -139,9 +147,11 @@ class Shadow:
         self.opened = False
         self.handles: dict[str, object] = {}
         self.armed_at = 0.0
-        self.others: Counter = Counter()
+        self.others: dict[str, set[str]] = {}
         self.others_since = clock()
         self.shape_seen: set[str] = set()
+        self.last_stored: dict[tuple[str, str], float] = {}
+        self.reports: Counter = Counter()
 
     async def _bounded(self, call) -> None:
         await asyncio.wait_for(call, BLUEZ_CALL_SECONDS)
@@ -152,11 +162,18 @@ class Shadow:
         self.store.add_telemetry(None, kind, {"error": type(exc).__name__})
 
     def found(self, label: str, device_path: str) -> None:
+        """Called for every matching advert. A trusted cuff's first match in an episode is stored; the rest
+        are counted. Other devices are kept only as a set of paths, reported as a count."""
         address = address_from_path(device_path)
-        if address and self.store.is_trusted(address):
+        if not (address and self.store.is_trusted(address)):
+            self.others.setdefault(label, set()).add(device_path)
+            return
+        self.reports[(label, address)] += 1
+        now = self.clock()
+        last = self.last_stored.get((label, address))
+        if last is None or now - last >= EPISODE_SECONDS:
+            self.last_stored[(label, address)] = now
             self.store.add_telemetry(address, "monitor-seen", {"monitor": label})
-        else:
-            self.others[label] += 1
 
     def released(self, label: str) -> None:
         self.handles.pop(label, None)
@@ -187,6 +204,10 @@ class Shadow:
         self.armed_at = self.clock()
 
     async def disarm(self) -> None:
+        if self.reports:
+            for (label, address), count in sorted(self.reports.items()):
+                self.store.add_telemetry(address, "monitor-reports", {"monitor": label, "reports": count})
+            self.reports.clear()
         handles, self.handles = self.handles, {}
         for handle in handles.values():
             try:
@@ -195,15 +216,16 @@ class Shadow:
                 self.store.add_telemetry(None, "monitor-unregister-failed", {"error": type(exc).__name__})
 
     async def tick(self) -> None:
-        """Re-arm every REARM_SECONDS, because a monitor reports a device once until it loses it (and
-        BlueZ may have released one); report the count of other devices' matches once an hour."""
+        """Re-arm, at most every REARM_SECONDS, once BlueZ has released a monitor; report how many other
+        devices each monitor matched, once an hour."""
         now = self.clock()
-        if self.enabled and now - self.armed_at >= REARM_SECONDS:
+        if self.enabled and len(self.handles) < len(PATTERNS) and now - self.armed_at >= REARM_SECONDS:
             await self.disarm()
             await self.arm()
+            self.armed_at = now
         if now - self.others_since >= OTHERS_REPORT_SECONDS:
             if self.others:
-                self.store.add_telemetry(None, "monitor-others", dict(self.others))
+                self.store.add_telemetry(None, "monitor-others", {label: len(paths) for label, paths in sorted(self.others.items())})
             self.others.clear()
             self.others_since = now
 
