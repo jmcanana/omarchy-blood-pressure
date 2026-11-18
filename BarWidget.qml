@@ -7,7 +7,10 @@ BarWidget {
   id: root
   moduleName: "jmcanana.blood-pressure"
 
-  readonly property string stateDir: (Quickshell.env("HOME") || "") + "/.local/state/jmcanana.blood-pressure"
+  readonly property string stateDir: {
+    var value = Quickshell.env("XDG_STATE_HOME") || ""
+    return (value.startsWith("/") ? value : (Quickshell.env("HOME") || "") + "/.local/state") + "/jmcanana.blood-pressure"
+  }
   property string syncState: "idle"
   property string concern: "none"
 

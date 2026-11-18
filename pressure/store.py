@@ -77,6 +77,8 @@ class Store:
         _private_dir(self.state_dir)
         self.db_path = self.data_dir / "pressure.sqlite"
         self.status_path = self.state_dir / "status.json"
+        # The state last written to status.json, so a repeating advert need not rewrite it.
+        self.last_status_state = ""
         self._db = sqlite3.connect(self.db_path)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA foreign_keys = ON")
@@ -297,19 +299,20 @@ class Store:
         row = self._db.execute("SELECT trusted FROM device WHERE address = ?", (address.lower(),)).fetchone()
         return bool(row and row["trusted"])
 
-    def remember_pending(self, token: str, address: str, name: str, beacon: str) -> None:
+    def remember_pending(self, token: str, address: str, name: str, beacon: str) -> bool:
         """Keep one sighting. The same device repeating the same advert keeps its token, so a Trust tap
         is not outrun by the next advert and the database is not rewritten twenty times a second;
-        any change of address, name or beacon replaces the token."""
+        any change of address, name or beacon replaces the token. Returns whether it was replaced."""
         row = self._db.execute("SELECT address, name, beacon FROM pending LIMIT 1").fetchone()
         if row is not None and (row["address"], row["name"], row["beacon"]) == (address.lower(), name, beacon):
-            return
+            return False
         self._db.execute("DELETE FROM pending")
         self._db.execute(
             "INSERT INTO pending(token, address, name, beacon, seen_at) VALUES(?, ?, ?, ?, ?)",
             (token, address.lower(), name, beacon, _now()),
         )
         self._db.commit()
+        return True
 
     def peek_pending(self, token: str) -> dict | None:
         row = self._db.execute(
@@ -581,3 +584,4 @@ class Store:
         temporary.write_text(json.dumps(document), encoding="utf-8")
         os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
         temporary.replace(self.status_path)
+        self.last_status_state = document["state"]

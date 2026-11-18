@@ -27,7 +27,13 @@ Panel {
   property int draftCuffUser: 1
 
   readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string stateDir: home + "/.local/state/jmcanana.blood-pressure"
+  readonly property string stateDir: root.xdgDir("XDG_STATE_HOME", "/.local/state") + "/jmcanana.blood-pressure"
+  readonly property string dataDir: root.xdgDir("XDG_DATA_HOME", "/.local/share") + "/jmcanana.blood-pressure"
+  // The XDG base directory rule, as pressure/run and the sidecar apply it: an absolute value or the default.
+  function xdgDir(name, fallback) {
+    var value = Quickshell.env(name) || ""
+    return value.startsWith("/") ? value : root.home + fallback
+  }
   readonly property color ink: Color.popups.text
   readonly property color surface: Color.popups.background
   readonly property color ink2: Qt.rgba(ink.r, ink.g, ink.b, inkAlpha(ink, surface, 4.5))
@@ -144,7 +150,10 @@ Panel {
   }
 
   property bool setupCopied: false
-  readonly property string setupText: "python3 -m venv ~/.local/share/jmcanana.blood-pressure/venv && ~/.local/share/jmcanana.blood-pressure/venv/bin/pip install \"bleak==3.0.2\""
+  readonly property string setupText: "python3 -m venv --clear \"" + root.dataDir + "/venv\" && \"" + root.dataDir + "/venv/bin/pip\" install \"bleak==3.0.2\""
+  // The sidecar's own words when setup is needed: bleak missing, or a python3 older than 3.11.
+  property string setupError: ""
+  readonly property bool pythonTooOld: root.setupError.startsWith("python")
 
   property bool capturing: false
   property bool copied: false
@@ -472,8 +481,8 @@ Panel {
               y: Style.space(14)
               width: parent.width - Style.space(32)
               spacing: Style.space(8)
-              Text { text: "Bluetooth library not installed"; color: root.ink; font.family: root.family; font.pixelSize: Style.font.title; font.weight: Font.DemiBold }
-              Text { width: parent.width; wrapMode: Text.WordWrap; text: "The plugin needs bleak in its own Python folder. Run this once in a terminal, then run omarchy restart shell:"; color: root.ink; font.family: root.family; font.pixelSize: Style.font.body }
+              Text { text: root.pythonTooOld ? "Python 3.11 or newer needed" : "Bluetooth library not installed"; color: root.ink; font.family: root.family; font.pixelSize: Style.font.title; font.weight: Font.DemiBold }
+              Text { width: parent.width; wrapMode: Text.WordWrap; text: root.pythonTooOld ? "The sidecar reports: " + root.setupError + ". Install a newer Python, run this once with it as python3, then run omarchy restart shell:" : "The plugin needs bleak in its own Python folder. Run this once in a terminal, then run omarchy restart shell:"; color: root.ink; font.family: root.family; font.pixelSize: Style.font.body }
               Rectangle {
                 width: parent.width
                 height: setupCommand.implicitHeight + Style.space(16)
@@ -995,6 +1004,7 @@ Panel {
       try { doc = JSON.parse(text() || "{}") } catch (error) { return }
       var previous = root.linkState
       root.linkState = doc.state || "idle"
+      root.setupError = root.linkState === "setup" ? String(doc.error || "") : ""
       if (previous !== root.linkState && root.opened) root.askSummary()
     }
   }

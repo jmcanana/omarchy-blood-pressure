@@ -623,11 +623,15 @@ class PanelPrivacyTests(unittest.TestCase):
         # The two definitions the allowlisted command lines use, pinned exactly.
         self.assertIn('  readonly property string sharePath: root.stateDir + "/pressure-share.png"\n', panel)
         self.assertIn(
-            '  readonly property string setupText: "python3 -m venv ~/.local/share/jmcanana.blood-pressure/venv'
-            ' && ~/.local/share/jmcanana.blood-pressure/venv/bin/pip install \\"bleak==3.0.2\\""\n',
+            '  readonly property string setupText: "python3 -m venv --clear \\"" + root.dataDir + "/venv\\" && \\""'
+            ' + root.dataDir + "/venv/bin/pip\\" install \\"bleak==3.0.2\\""\n',
             panel,
         )
-        self.assertEqual(len(re.findall(r"property string (?:sharePath|setupText)\b", panel)), 2)
+        self.assertIn(
+            '  readonly property string dataDir: root.xdgDir("XDG_DATA_HOME", "/.local/share") + "/jmcanana.blood-pressure"\n',
+            panel,
+        )
+        self.assertEqual(len(re.findall(r"property string (?:sharePath|setupText|dataDir)\b", panel)), 3)
 
     def test_the_scan_catches_every_form(self) -> None:
         planted = [
@@ -1432,6 +1436,131 @@ class ReviewTests(unittest.TestCase):
         looking_at_second = json.loads((root / "state" / "status.json").read_text(encoding="utf-8"))["concern"]
         self.assertEqual(looking_at_first, "severe")
         self.assertEqual(looking_at_second, "severe")
+
+
+class QuietScanTests(unittest.TestCase):
+    """The November 18 review: the launcher's Python check, one path rule, one "seen" write per sighting,
+    the failure type on a connect, and the exit code that tells Service.qml a scan was lost."""
+
+    WINDOW = {105: bytes.fromhex("020501640080"), 76: bytes.fromhex("001122334455a1030001c3")}
+
+    def fake_venv(self, root: Path, script: str) -> Path:
+        """A data directory whose venv python is a shell script standing in for an old or broken Python."""
+        python = root / "data" / "venv" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.write_text("#!/bin/bash\n" + script, encoding="utf-8")
+        python.chmod(0o755)
+        return root / "data"
+
+    def launch(self, data: Path, state: Path) -> subprocess.CompletedProcess:
+        run = Path(__file__).resolve().parent.parent / "pressure" / "run"
+        return subprocess.run([str(run), "--state", str(state), "--data", str(data)],
+                              capture_output=True, text=True, timeout=20)
+
+    def test_an_old_python_is_reported_in_the_status_and_not_started(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        data = self.fake_venv(root, 'case "$2" in *print*) echo 3.10 ;; *) exit 1 ;; esac\n')
+        result = self.launch(data, root / "state")
+        self.assertEqual(result.returncode, 4)
+        self.assertNotIn("ready", result.stdout)
+        status = json.loads((root / "state" / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(status), set(STATUS_KEYS))
+        self.assertEqual(status["state"], "setup")
+        self.assertIn("python 3.10 is too old", status["error"])
+        self.assertEqual(oct((root / "state" / "status.json").stat().st_mode & 0o777), "0o600")
+
+    def test_a_python_that_will_not_run_is_named_as_missing(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        data = self.fake_venv(root, "exit 127\n")
+        result = self.launch(data, root / "state")
+        self.assertEqual(result.returncode, 4)
+        status = json.loads((root / "state" / "status.json").read_text(encoding="utf-8"))
+        self.assertIn("python3 was not found", status["error"])
+
+    def test_the_venv_is_looked_for_under_the_data_directory_passed(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        data = self.fake_venv(root, 'case "$2" in *print*) echo 3.10 ;; *) exit 1 ;; esac\n')
+        # XDG_DATA_HOME points elsewhere; the venv under --data is the one used, so the old one is caught.
+        env = dict(os.environ, XDG_DATA_HOME=str(root / "elsewhere"))
+        run = Path(__file__).resolve().parent.parent / "pressure" / "run"
+        result = subprocess.run([str(run), "--state", str(root / "state"), "--data", str(data)],
+                                capture_output=True, text=True, timeout=20, env=env)
+        self.assertEqual(result.returncode, 4)
+
+    def test_xdg_directories_are_honoured_and_relative_ones_ignored(self) -> None:
+        import argparse
+        from unittest import mock
+
+        from pressure import sidecar
+
+        empty = argparse.Namespace(data=None, state=None)
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": "/srv/d", "XDG_STATE_HOME": "/srv/s"}):
+            self.assertEqual(sidecar._dirs(empty), (Path("/srv/d/jmcanana.blood-pressure"), Path("/srv/s/jmcanana.blood-pressure")))
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": "relative", "XDG_STATE_HOME": ""}):
+            data, state = sidecar._dirs(empty)
+        self.assertEqual(data, Path.home() / ".local/share/jmcanana.blood-pressure")
+        self.assertEqual(state, Path.home() / ".local/state/jmcanana.blood-pressure")
+        root = Path(__file__).resolve().parent.parent
+        for name in ("Service.qml", "Panel.qml", "BarWidget.qml"):
+            text = (root / name).read_text(encoding="utf-8")
+            self.assertIn('"XDG_STATE_HOME"', text, name)
+            self.assertNotIn('home + "/.local/state/jmcanana', text, name)
+
+    def test_a_repeating_untrusted_advert_writes_the_status_once(self) -> None:
+        writes: list[str] = []
+
+        def twenty_adverts(callback, store) -> None:
+            original = store.write_status
+
+            def counted(**fields) -> None:
+                writes.append(str(fields.get("state")))
+                original(**fields)
+
+            store.write_status = counted
+            device = type("Device", (), {"address": "aa:bb:cc:dd:ee:09", "name": "UA-810BLE"})()
+            advert = type("Advert", (), {"manufacturer_data": self.WINDOW, "service_uuids": [], "local_name": ""})()
+            for _ in range(20):
+                callback(device, advert)
+            store.write_status(state="scanning", beacon="none", link=False, error="")
+            callback(device, advert)
+            callback(device, advert)
+
+        _result, _log, store = WatchdogTests().run_radio([WatchdogTests.UP], seconds=0.3, trigger=twenty_adverts)
+        # 20 adverts give one "seen"; after another write moved the status, the next advert restores it.
+        # The last "scanning" is the radio's own write once the scanner has started.
+        self.assertEqual(writes, ["seen", "scanning", "seen", "scanning"])
+        self.assertIsNotNone(store.pending_public())
+
+    def test_a_failed_connect_records_the_error_type_only(self) -> None:
+        def trusted_window(callback, store) -> None:
+            store.trust("aa:bb:cc:dd:ee:01", "Synthetic")
+            device = type("Device", (), {"address": "aa:bb:cc:dd:ee:01", "name": "UA-810BLE"})()
+            advert = type("Advert", (), {"manufacturer_data": self.WINDOW, "service_uuids": [], "local_name": ""})()
+            callback(device, advert)
+
+        # The resume is refused so the trigger, which runs at every scanner start, fires once.
+        _result, _log, store = WatchdogTests().run_radio(
+            [WatchdogTests.UP], seconds=2.0, fail_resume=True, trigger=trusted_window
+        )
+        ends = [row["body"] for row in store.telemetry_public(False) if row["kind"] == "connect-end"]
+        self.assertTrue(ends)
+        self.assertEqual((ends[0]["outcome"], ends[0]["error"]), ("failed", "RuntimeError"))
+        self.assertNotIn("le-connection-abort", json.dumps(ends))
+
+    def test_a_lost_scan_exits_with_the_code_service_restarts_at_once(self) -> None:
+        from unittest import mock
+
+        from pressure import sidecar
+        from pressure.radio import ScanLost
+
+        async def lost(*_args) -> None:
+            raise ScanLost("test")
+
+        with mock.patch.object(sidecar, "supervise", lost), self.assertRaises(SystemExit) as caught:
+            sidecar.main(["--data", tempfile.mkdtemp(), "--state", tempfile.mkdtemp()])
+        self.assertEqual(caught.exception.code, sidecar.SCAN_LOST_EXIT)
+        service = (Path(__file__).resolve().parent.parent / "Service.qml").read_text(encoding="utf-8")
+        self.assertIn(f"readonly property int scanLostExit: {sidecar.SCAN_LOST_EXIT}\n", service)
 
 
 if __name__ == "__main__":

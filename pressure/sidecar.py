@@ -23,13 +23,25 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from pressure.commands import handle, write_response
+from pressure.radio import ScanLost
 from pressure.store import Store, _private_dir
+
+# Service.qml restarts this exit code in 4 s and backs off every other one.
+SCAN_LOST_EXIT = 3
+
+
+PLUGIN_ID = "jmcanana.blood-pressure"
+
+
+def _xdg_dir(name: str, fallback: str) -> Path:
+    """The XDG base directory rule, as Service.qml and pressure/run apply it: an absolute value or the default."""
+    value = os.environ.get(name, "")
+    return Path(value) if value.startswith("/") else Path.home() / fallback
 
 
 def _dirs(args: argparse.Namespace) -> tuple[Path, Path]:
-    home = Path.home()
-    data = Path(args.data) if args.data else home / ".local" / "share" / "jmcanana.blood-pressure"
-    state = Path(args.state) if args.state else home / ".local" / "state" / "jmcanana.blood-pressure"
+    data = Path(args.data) if args.data else _xdg_dir("XDG_DATA_HOME", ".local/share") / PLUGIN_ID
+    state = Path(args.state) if args.state else _xdg_dir("XDG_STATE_HOME", ".local/state") / PLUGIN_ID
     return data, state
 
 
@@ -219,7 +231,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.self_check or args.demo:
         _run_offline(args, data, state)
         return
-    asyncio.run(_run_until_stopped(supervise(data, state), args.parent_pid))
+    try:
+        asyncio.run(_run_until_stopped(supervise(data, state), args.parent_pid))
+    except* ScanLost as lost:
+        print(f"scan lost, exiting for a restart: {lost.exceptions[0]}", file=sys.stderr, flush=True)
+        sys.exit(SCAN_LOST_EXIT)
 
 
 def _run_offline(args: argparse.Namespace, data: Path, state: Path) -> None:

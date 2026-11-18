@@ -1,12 +1,58 @@
 #!/bin/bash
-# Prefer the private venv. Fall back to python3 on PATH. Do not source bashrc.
+# Prefer the private venv under the data directory Service.qml passes. Fall back to python3 on PATH.
+# Do not source bashrc.
 set -euo pipefail
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/.." && pwd)
+
 data="${XDG_DATA_HOME:-$HOME/.local/share}/jmcanana.blood-pressure"
+state="${XDG_STATE_HOME:-$HOME/.local/state}/jmcanana.blood-pressure"
+args=("$@")
+for ((i = 0; i < ${#args[@]} - 1; i++)); do
+  case "${args[i]}" in
+    --data) data="${args[i + 1]}" ;;
+    --state) state="${args[i + 1]}" ;;
+  esac
+done
+
 py=python3
 if [[ -x "$data/venv/bin/python" ]]; then
   py="$data/venv/bin/python"
 fi
+
+# Exit codes Service.qml reads: 3 restarts at once (a lost scan); anything else backs off.
+SETUP_EXIT=4
+
+mkdir -p -- "$state"
+chmod 700 "$state"
+
+# The sidecar needs asyncio.TaskGroup (3.11). An older python3 would print ready and die, in a loop
+# nobody sees, so say it in the status the panel already shows.
+version=$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)
+if ! "$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+  if [[ -n "$version" ]]; then
+    problem="python $version is too old: the sidecar needs 3.11 or newer"
+  else
+    problem="python3 was not found: the sidecar needs 3.11 or newer"
+  fi
+  status_tmp="$state/status.json.tmp"
+  (
+    umask 077
+    printf '{"state": "setup", "concern": "none", "records": 0, "unassigned": 0, "patients": 0, "beacon": "none", "link": false, "error": "%s", "trusted": 0}\n' \
+      "$problem" >"$status_tmp"
+  )
+  mv -f -- "$status_tmp" "$state/status.json"
+  echo "$problem" >&2
+  exit "$SETUP_EXIT"
+fi
+
+# Keep the sidecar's stderr: Quickshell discards it. One previous file is kept; each holds 256 kB at most.
+log="$state/sidecar.log"
+if [[ -f "$log" ]] && (($(stat -c %s -- "$log" 2>/dev/null || stat -f %z -- "$log") > 262144)); then
+  mv -f -- "$log" "$log.1"
+fi
+(umask 077 && touch -- "$log")
+exec 2>>"$log"
+
 # exec keeps this pid, so $PPID is the shell the sidecar must not outlive.
 exec "$py" "$root/pressure/sidecar.py" --parent-pid "$PPID" "$@"

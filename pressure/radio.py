@@ -1,4 +1,4 @@
-"""BlueZ scan and one-link drain. Imported only when the sidecar really runs."""
+"""BlueZ scan and one-link drain. bleak is imported only when the radio runs."""
 
 from __future__ import annotations
 
@@ -182,9 +182,12 @@ async def radio_loop(store: Store, live: dict) -> None:
         address = str(device.address)
         name = advertisement.local_name or device.name or ""
         if not store.is_trusted(address):
-            store.remember_pending(secrets.token_hex(8), address, name, kind)
+            replaced = store.remember_pending(secrets.token_hex(8), address, name, kind)
             live["beacon"] = kind
-            store.write_status(state="seen", beacon=kind, link=False, error="")
+            # Once per new sighting, or again after another write moved the status off "seen":
+            # an untrusted cuff advertises about twenty times a second.
+            if replaced or store.last_status_state != "seen":
+                store.write_status(state="seen", beacon=kind, link=False, error="")
             return
         if not should_drain(uuids, manufacturer, store.trusted_beacon(address)):
             return
@@ -221,6 +224,7 @@ async def radio_loop(store: Store, live: dict) -> None:
             except Exception as exc:
                 store.add_telemetry(str(device.address), "scan-stop-failed", {"error": type(exc).__name__})
             outcome = "ok"
+            failure = ""
             started = time.monotonic()
             store.add_telemetry(str(device.address), "connect-start", {"beacon": kind})
             try:
@@ -261,16 +265,17 @@ async def radio_loop(store: Store, live: dict) -> None:
                 outcome = "timeout"
                 live.update(state="scanning", link=False, error="timed out")
                 store.write_status(state="scanning", beacon="none", link=False, error="timed out")
-            except Exception:
+            except Exception as exc:
                 outcome = "failed"
+                # The type only: a bleak message can carry a device path.
+                failure = type(exc).__name__
                 live.update(state="scanning", link=False, error="connection failed")
                 store.write_status(state="scanning", beacon="none", link=False, error="connection failed")
             finally:
-                store.add_telemetry(
-                    str(device.address),
-                    "connect-end",
-                    {"outcome": outcome, "seconds": round(time.monotonic() - started, 3)},
-                )
+                ended = {"outcome": outcome, "seconds": round(time.monotonic() - started, 3)}
+                if failure:
+                    ended["error"] = failure
+                store.add_telemetry(str(device.address), "connect-end", ended)
             if outcome == "ok":
                 live.update(state="scanning", link=False, error="")
                 store.add_telemetry(str(device.address), "disconnect", {"beacon": kind})
