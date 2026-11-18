@@ -1609,11 +1609,14 @@ class FakeRegistrar:
     async def open(self) -> None:
         self.log.append("open")
 
-    async def register(self, label, pattern, found, released):
+    async def register(self, label, pattern, found, released, activated):
+        from pressure.shadow import MonitorRefused
+
         if label == self.refuse:
-            raise RuntimeError("org.bluez.Error.Failed")
+            raise MonitorRefused("org.bluez.Error.Failed")
         self.log.append(f"arm:{label}")
         self.callbacks[label] = (found, released)
+        self.activated = activated
         self.patterns[label] = pattern
         return label
 
@@ -1650,12 +1653,14 @@ class ShadowTests(unittest.TestCase):
 
         shadow, _store_, registrar, log, _now = self.make()
         asyncio.run(shadow.arm())
-        self.assertEqual(log, ["open", "arm:company", "arm:tail", "arm:ibeacon"])
+        self.assertEqual(log, ["open", "arm:company", "arm:window", "arm:tail", "arm:ibeacon"])
         self.assertEqual(registrar.patterns["company"], (0, 0xFF, b"\x69\x00"))
+        # The window's payload starts 02 and the START burst's 01 (policy.py), right after the company id.
+        self.assertEqual(registrar.patterns["window"], (0, 0xFF, b"\x69\x00\x02"))
         # 2 company bytes, 02 15, and a 16-byte UUID put the iBeacon's major, minor and power at 20.
         self.assertEqual(registrar.patterns["tail"], (20, 0xFF, bytes.fromhex("a1030001c3")))
         self.assertEqual(registrar.patterns["ibeacon"], (0, 0xFF, bytes.fromhex("4c000215")))
-        self.assertEqual(set(PATTERNS), {"company", "tail", "ibeacon"})
+        self.assertEqual(set(PATTERNS), {"company", "window", "tail", "ibeacon"})
 
     def test_only_the_trusted_cuff_is_stored_and_others_are_only_counted(self) -> None:
         import asyncio
@@ -1684,7 +1689,8 @@ class ShadowTests(unittest.TestCase):
         asyncio.run(shadow.arm())
         self.assertFalse(shadow.enabled)
         self.assertIn("disarm:company", log)
-        self.assertIn("monitor-refused", self.kinds(store))
+        refused = [row["body"] for row in store.telemetry_public(True) if row["kind"] == "monitor-refused"]
+        self.assertEqual(refused, [{"error": "MonitorRefused", "name": "org.bluez.Error.Failed"}])
         now["t"] += 1000
         asyncio.run(shadow.tick())
         self.assertEqual(log.count("arm:company"), 1)
@@ -1701,11 +1707,13 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(log.count("arm:company"), 1)
         _found, released = registrar.callbacks["tail"]
         released("tail")
-        self.assertNotIn("tail", shadow.handles)
         self.assertIn("monitor-released", self.kinds(store))
         asyncio.run(shadow.tick())
         self.assertEqual(log.count("arm:tail"), 2)
-        self.assertEqual(set(shadow.handles), {"company", "tail", "ibeacon"})
+        # The released monitor is unregistered before it is registered again (BlueZ: AlreadyExists).
+        self.assertLess(log.index("disarm:tail"), len(log) - 1 - log[::-1].index("arm:tail"))
+        self.assertEqual(set(shadow.handles), {"company", "window", "tail", "ibeacon"})
+        self.assertEqual(shadow.released_labels, set())
 
     def test_every_advert_is_counted_and_one_row_is_stored_per_episode(self) -> None:
         import asyncio
@@ -1730,6 +1738,49 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(reports, [{"monitor": "company", "reports": 42}])
         asyncio.run(shadow.disarm())
         self.assertEqual(len([row for row in store.telemetry_public(True) if row["kind"] == "monitor-reports"]), 1)
+
+    def test_activate_is_the_positive_control(self) -> None:
+        import asyncio
+
+        shadow, store, registrar, _log, _now = self.make()
+        asyncio.run(shadow.arm())
+        registrar.activated("company")
+        registrar.activated("window")
+        active = [row["body"]["monitor"] for row in store.telemetry_public(True) if row["kind"] == "monitor-active"]
+        self.assertEqual(sorted(active), ["company", "window"])
+
+    def test_a_trial_ends_by_itself_after_thirty_minutes(self) -> None:
+        import asyncio
+
+        from pressure.shadow import TRIAL_SECONDS
+
+        shadow, store, _registrar, log, now = self.make()
+        asyncio.run(shadow.arm())
+        now["t"] += TRIAL_SECONDS - 1
+        asyncio.run(shadow.tick())
+        self.assertTrue(shadow.handles)
+        now["t"] += 1
+        asyncio.run(shadow.tick())
+        self.assertEqual(shadow.handles, {})
+        self.assertFalse(shadow.enabled)
+        self.assertIn("shadow-ended", self.kinds(store))
+        self.assertIn("disarm:ibeacon", log)
+        asyncio.run(shadow.arm())
+        self.assertEqual(log.count("arm:company"), 1)
+
+    def test_an_arm_after_the_box_closed_ends_the_trial_instead(self) -> None:
+        import asyncio
+
+        from pressure.shadow import TRIAL_SECONDS
+
+        shadow, store, _registrar, log, now = self.make()
+        asyncio.run(shadow.arm())
+        asyncio.run(shadow.disarm())
+        now["t"] += TRIAL_SECONDS
+        asyncio.run(shadow.arm())
+        self.assertEqual(log.count("arm:company"), 1)
+        self.assertFalse(shadow.enabled)
+        self.assertIn("shadow-ended", self.kinds(store))
 
     def test_the_apple_shape_is_noted_once_per_run(self) -> None:
         shadow, store, _registrar, _log, _now = self.make()
@@ -1769,7 +1820,7 @@ class ShadowTests(unittest.TestCase):
         first_stop = log.index("stop")
         connect = log.index("connect")
         self.assertLess(log.index("arm:ibeacon"), first_stop)
-        self.assertEqual(log[first_stop + 1:connect], ["disarm:company", "disarm:tail", "disarm:ibeacon"])
+        self.assertEqual(log[first_stop + 1:connect], ["disarm:company", "disarm:window", "disarm:tail", "disarm:ibeacon"])
         kinds = [row["kind"] for row in store.telemetry_public(False)]
         self.assertIn("connect-end", kinds)
         self.assertIn("apple-shape", kinds)

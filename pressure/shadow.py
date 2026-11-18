@@ -12,9 +12,16 @@ BlueZ 5.87 calls DeviceFound on every matching advert for a monitor without RSSI
 trusted cuff's match is stored once per episode (EPISODE_SECONDS) per monitor, with the reports counted
 and written when the monitors are removed. Other devices are counted as distinct devices, never named.
 
+A trial is time-boxed: TRIAL_SECONDS after the first arm the monitors are removed for the rest of the
+run (`shadow-ended`), so a trial is one enable (a plugin disable and enable) per measurement. BlueZ calls
+Activate once the kernel has accepted a monitor's pattern; that is the positive control (`monitor-active`):
+a trial with no such row heard nothing because nothing was listening.
+
 Patterns (an or-pattern matches its bytes at a fixed offset inside one AD structure's data):
 - company: the A&D company id 105 (0x0069, little-endian) at the start of manufacturer data. The START
   burst and the window carry it.
+- window: company 105 followed by the payload's first byte 02, which only the window carries (the START
+  burst's is 01), so a window row tells the window from the START burst.
 - tail: the transfer iBeacon's major, minor and power, a1030001c3, at offset 20 of Apple's manufacturer
   data (2 company bytes, 02 15, a 16-byte UUID). The `apple-shape` row records the length the cuff's
   Apple value really has, which proves or disproves that offset.
@@ -36,10 +43,12 @@ from pressure.store import Store
 MANUFACTURER_DATA = 0xFF
 PATTERNS: dict[str, tuple[int, int, bytes]] = {
     "company": (0, MANUFACTURER_DATA, bytes.fromhex("6900")),
+    "window": (0, MANUFACTURER_DATA, bytes.fromhex("690002")),
     "tail": (20, MANUFACTURER_DATA, bytes.fromhex("a1030001c3")),
     "ibeacon": (0, MANUFACTURER_DATA, bytes.fromhex("4c000215")),
 }
 REARM_SECONDS = 120.0
+TRIAL_SECONDS = 1800.0
 EPISODE_SECONDS = 300.0
 BLUEZ_CALL_SECONDS = 1.0
 OTHERS_REPORT_SECONDS = 3600.0
@@ -64,6 +73,14 @@ def address_from_path(path: str) -> str:
     return leaf[4:].replace("_", ":").lower()
 
 
+class MonitorRefused(RuntimeError):
+    """BlueZ answered RegisterMonitor with an error; `name` is its D-Bus error name."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.name = name
+
+
 class BluezRegistrar:
     """Registers monitors with org.bluez.AdvertisementMonitorManager1 on its own system-bus connection,
     the way bleak 3.0.2 registers its passive scanner's monitor (register, then export)."""
@@ -71,6 +88,8 @@ class BluezRegistrar:
     def __init__(self, adapter_path: str) -> None:
         self.adapter_path = adapter_path
         self.bus = None
+        # A fresh object path per registration: BlueZ may still hold an old one (AlreadyExists).
+        self.serial = 0
 
     async def open(self) -> None:
         from dbus_fast import BusType
@@ -78,7 +97,9 @@ class BluezRegistrar:
 
         self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
-    async def register(self, label: str, pattern: tuple[int, int, bytes], found: Callable, released: Callable):
+    async def register(
+        self, label: str, pattern: tuple[int, int, bytes], found: Callable, released: Callable, activated: Callable
+    ):
         from dbus_fast import Message, MessageType
         from dbus_fast.service import method
 
@@ -90,6 +111,10 @@ class BluezRegistrar:
                 released(label)
 
             @method()
+            def Activate(self):  # noqa: N802
+                activated(label)
+
+            @method()
             def DeviceFound(self, device: "o"):  # noqa: F821, N802
                 found(label, device)
 
@@ -98,7 +123,8 @@ class BluezRegistrar:
                 return None
 
         monitor = Monitor([pattern])
-        path = f"/org/jmcanana/bloodpressure/{os.getpid()}/{label}"
+        self.serial += 1
+        path = f"/org/jmcanana/bloodpressure/{os.getpid()}/{label}{self.serial}"
         reply = await self.bus.call(
             Message(
                 destination="org.bluez",
@@ -110,7 +136,7 @@ class BluezRegistrar:
             )
         )
         if reply.message_type == MessageType.ERROR:
-            raise RuntimeError(reply.error_name)
+            raise MonitorRefused(str(reply.error_name))
         self.bus.export(path, monitor)
         return path, monitor
 
@@ -152,6 +178,8 @@ class Shadow:
         self.shape_seen: set[str] = set()
         self.last_stored: dict[tuple[str, str], float] = {}
         self.reports: Counter = Counter()
+        self.released_labels: set[str] = set()
+        self.trial_started: float | None = None
 
     async def _bounded(self, call) -> None:
         await asyncio.wait_for(call, BLUEZ_CALL_SECONDS)
@@ -159,7 +187,21 @@ class Shadow:
     def _off(self, kind: str, exc: BaseException) -> None:
         self.enabled = False
         self.handles.clear()
-        self.store.add_telemetry(None, kind, {"error": type(exc).__name__})
+        body = {"error": type(exc).__name__}
+        if isinstance(exc, MonitorRefused):
+            body["name"] = exc.name
+        self.store.add_telemetry(None, kind, body)
+
+    def _trial_over(self) -> bool:
+        return self.trial_started is not None and self.clock() - self.trial_started >= TRIAL_SECONDS
+
+    async def _end_trial(self) -> None:
+        await self.disarm()
+        self.enabled = False
+        self.store.add_telemetry(None, "shadow-ended", {"after_seconds": round(self.clock() - self.trial_started)})
+
+    def activated(self, label: str) -> None:
+        self.store.add_telemetry(None, "monitor-active", {"monitor": label})
 
     def found(self, label: str, device_path: str) -> None:
         """Called for every matching advert. A trusted cuff's first match in an episode is stored; the rest
@@ -176,7 +218,8 @@ class Shadow:
             self.store.add_telemetry(address, "monitor-seen", {"monitor": label})
 
     def released(self, label: str) -> None:
-        self.handles.pop(label, None)
+        """The handle is kept, so the re-arm unregisters it before registering again."""
+        self.released_labels.add(label)
         self.store.add_telemetry(None, "monitor-released", {"monitor": label})
 
     def note_apple_shape(self, address: str, apple_value: bytes | None) -> None:
@@ -189,19 +232,26 @@ class Shadow:
     async def arm(self) -> None:
         if not self.enabled or self.handles:
             return
+        if self._trial_over():
+            await self._end_trial()
+            return
         try:
             if not self.opened:
                 await self._bounded(self.registrar.open())
                 self.opened = True
             for label, pattern in PATTERNS.items():
                 self.handles[label] = await asyncio.wait_for(
-                    self.registrar.register(label, pattern, self.found, self.released), BLUEZ_CALL_SECONDS
+                    self.registrar.register(label, pattern, self.found, self.released, self.activated),
+                    BLUEZ_CALL_SECONDS,
                 )
         except Exception as exc:
             await self.disarm()
             self._off("monitor-refused", exc)
             return
+        self.released_labels.clear()
         self.armed_at = self.clock()
+        if self.trial_started is None:
+            self.trial_started = self.armed_at
 
     async def disarm(self) -> None:
         if self.reports:
@@ -216,10 +266,12 @@ class Shadow:
                 self.store.add_telemetry(None, "monitor-unregister-failed", {"error": type(exc).__name__})
 
     async def tick(self) -> None:
-        """Re-arm, at most every REARM_SECONDS, once BlueZ has released a monitor; report how many other
-        devices each monitor matched, once an hour."""
+        """End the trial once TRIAL_SECONDS have passed; re-arm, at most every REARM_SECONDS, once BlueZ has
+        released a monitor; report how many other devices each monitor matched, once an hour."""
         now = self.clock()
-        if self.enabled and len(self.handles) < len(PATTERNS) and now - self.armed_at >= REARM_SECONDS:
+        if self.enabled and self._trial_over():
+            await self._end_trial()
+        elif self.enabled and self.released_labels and now - self.armed_at >= REARM_SECONDS:
             await self.disarm()
             await self.arm()
             self.armed_at = now
