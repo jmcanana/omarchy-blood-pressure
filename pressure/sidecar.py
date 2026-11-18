@@ -179,9 +179,13 @@ async def _radio(store: Store, live: dict) -> None:
         live.update(state="setup", error=BLEAK_MISSING)
         store.write_status(state="setup", beacon="none", link=False, error=BLEAK_MISSING)
         return
-    from pressure.radio import radio_loop
+    from pressure.radio import ADAPTER_PATH, radio_loop
+    from pressure.shadow import BluezRegistrar, Shadow, scan_mode
 
-    await radio_loop(store, live)
+    mode = scan_mode(store.state_dir)
+    store.add_telemetry(None, "scan-mode", {"mode": mode})
+    shadow = Shadow(store, BluezRegistrar(ADAPTER_PATH)) if mode == "shadow" else None
+    await radio_loop(store, live, shadow)
 
 
 def self_check(data: Path, state: Path) -> None:

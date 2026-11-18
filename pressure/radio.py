@@ -9,12 +9,14 @@ from datetime import datetime
 
 from pressure.collector import drain
 from pressure.policy import (
+    APPLE_COMPANY,
     CONNECT_TIMEOUT_SECONDS,
     arms_session,
     beacon_class,
     should_connect,
     should_drain,
 )
+from pressure.shadow import Shadow
 from pressure.store import Store
 
 
@@ -155,7 +157,9 @@ class _BleakLink:
         await self.client.write_gatt_char(uuid, payload, response=True)
 
 
-async def radio_loop(store: Store, live: dict) -> None:
+async def radio_loop(store: Store, live: dict, shadow: Shadow | None = None) -> None:
+    """Scan, and drain a trusted cuff in its window. `shadow`, when given, runs the shadow listeners beside
+    the scan; they are disarmed before every connect, so the connect path is the same with or without them."""
     from bleak import BleakClient, BleakScanner
 
     target: dict = {}
@@ -168,7 +172,10 @@ async def radio_loop(store: Store, live: dict) -> None:
         uuids = [str(item) for item in (advertisement.service_uuids or [])]
         kind = beacon_class(manufacturer)
         address = str(device.address)
-        if store.is_trusted(address) and arms_session(kind):
+        trusted = store.is_trusted(address)
+        if trusted and shadow is not None and APPLE_COMPANY in manufacturer:
+            shadow.note_apple_shape(address, manufacturer[APPLE_COMPANY])
+        if trusted and arms_session(kind):
             if kind != shown_kind and not target:
                 shown_kind = kind
                 live.update(state="ready", beacon=kind)
@@ -179,9 +186,8 @@ async def radio_loop(store: Store, live: dict) -> None:
             return
         if not should_connect(uuids, manufacturer):
             return
-        address = str(device.address)
         name = advertisement.local_name or device.name or ""
-        if not store.is_trusted(address):
+        if not trusted:
             replaced = store.remember_pending(secrets.token_hex(8), address, name, kind)
             live["beacon"] = kind
             # Once per new sighting, or again after another write moved the status off "seen":
@@ -202,12 +208,16 @@ async def radio_loop(store: Store, live: dict) -> None:
     live["state"] = "scanning"
     store.write_status(state="scanning", beacon="none", link=False, error="")
     try:
+        if shadow is not None:
+            await shadow.arm()
         while True:
             if not await woken_within(wake, SCAN_CHECK_SECONDS):
                 adapter = await adapter_state()
                 if scan_lost(adapter):
                     store.add_telemetry(None, "scan-lost", {"powered": True, "discovering": False})
                     raise ScanLost("BlueZ is no longer discovering")
+                if shadow is not None and not target:
+                    await shadow.tick()
                 continue
             wake.clear()
             if "device" not in target:
@@ -223,6 +233,8 @@ async def radio_loop(store: Store, live: dict) -> None:
                 await scanner.stop()
             except Exception as exc:
                 store.add_telemetry(str(device.address), "scan-stop-failed", {"error": type(exc).__name__})
+            if shadow is not None:
+                await shadow.disarm()
             outcome = "ok"
             failure = ""
             started = time.monotonic()
@@ -291,7 +303,11 @@ async def radio_loop(store: Store, live: dict) -> None:
                     store.write_status(state="error", beacon="none", link=False, error="scan did not resume")
                     store.add_telemetry(None, "scan-lost", {"resume_failed": True})
                     raise ScanLost("scan did not resume after a sync") from None
+            if shadow is not None:
+                await shadow.arm()
     finally:
+        if shadow is not None:
+            await shadow.close()
         try:
             await scanner.stop()
         except Exception:

@@ -262,7 +262,7 @@ class WatchdogTests(unittest.TestCase):
     LOST = {"Powered": True, "Discovering": False}
     OFF = {"Powered": False, "Discovering": False}
 
-    def run_radio(self, states: list, seconds: float = 0.5, fail_resume: bool = False, trigger=None):
+    def run_radio(self, states: list, seconds: float = 0.5, fail_resume: bool = False, trigger=None, shadow=None):
         import asyncio
         import types
         from unittest import mock
@@ -292,6 +292,7 @@ class WatchdogTests(unittest.TestCase):
                 pass
 
             async def __aenter__(self):
+                log.append("connect")
                 raise RuntimeError("le-connection-abort-by-local")
 
             async def __aexit__(self, *_exc) -> None:
@@ -315,7 +316,8 @@ class WatchdogTests(unittest.TestCase):
             mock.patch.object(radio, "SCAN_CHECK_SECONDS", 0.01),
         ):
             try:
-                asyncio.run(asyncio.wait_for(radio.radio_loop(store, {}), seconds))
+                made = shadow(store, log) if shadow else None
+                asyncio.run(asyncio.wait_for(radio.radio_loop(store, {}, made), seconds))
             except TimeoutError:
                 return "kept-scanning", log, store
             except radio.ScanLost:
@@ -1561,6 +1563,187 @@ class QuietScanTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, sidecar.SCAN_LOST_EXIT)
         service = (Path(__file__).resolve().parent.parent / "Service.qml").read_text(encoding="utf-8")
         self.assertIn(f"readonly property int scanLostExit: {sidecar.SCAN_LOST_EXIT}\n", service)
+
+
+class FakeRegistrar:
+    """Stands in for BluezRegistrar: records calls, and refuses a label on request."""
+
+    def __init__(self, log: list[str], refuse: str = "") -> None:
+        self.log = log
+        self.refuse = refuse
+        self.callbacks: dict[str, tuple] = {}
+        self.patterns: dict[str, tuple] = {}
+
+    async def open(self) -> None:
+        self.log.append("open")
+
+    async def register(self, label, pattern, found, released):
+        if label == self.refuse:
+            raise RuntimeError("org.bluez.Error.Failed")
+        self.log.append(f"arm:{label}")
+        self.callbacks[label] = (found, released)
+        self.patterns[label] = pattern
+        return label
+
+    async def unregister(self, handle) -> None:
+        self.log.append(f"disarm:{handle}")
+
+    async def close(self) -> None:
+        self.log.append("close")
+
+
+class ShadowTests(unittest.TestCase):
+    """Phase 0 of passive scanning: listeners beside the active scan that change nothing in the sync."""
+
+    CUFF = "aa:bb:cc:dd:ee:01"
+    CUFF_PATH = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_01"
+
+    def make(self, refuse: str = ""):
+        from pressure.shadow import Shadow
+
+        store, _root = _store()
+        store.trust(self.CUFF, "Synthetic")
+        log: list[str] = []
+        now = {"t": 1000.0}
+        registrar = FakeRegistrar(log, refuse)
+        return Shadow(store, registrar, clock=lambda: now["t"]), store, registrar, log, now
+
+    def kinds(self, store) -> list[str]:
+        return [row["kind"] for row in store.telemetry_public(True)]
+
+    def test_the_patterns_sit_at_the_offsets_the_capture_gives(self) -> None:
+        import asyncio
+
+        from pressure.shadow import PATTERNS
+
+        shadow, _store_, registrar, log, _now = self.make()
+        asyncio.run(shadow.arm())
+        self.assertEqual(log, ["open", "arm:company", "arm:tail", "arm:ibeacon"])
+        self.assertEqual(registrar.patterns["company"], (0, 0xFF, b"\x69\x00"))
+        # 2 company bytes, 02 15, and a 16-byte UUID put the iBeacon's major, minor and power at 20.
+        self.assertEqual(registrar.patterns["tail"], (20, 0xFF, bytes.fromhex("a1030001c3")))
+        self.assertEqual(registrar.patterns["ibeacon"], (0, 0xFF, bytes.fromhex("4c000215")))
+        self.assertEqual(set(PATTERNS), {"company", "tail", "ibeacon"})
+
+    def test_only_the_trusted_cuff_is_stored_and_others_are_only_counted(self) -> None:
+        import asyncio
+
+        shadow, store, registrar, _log, now = self.make()
+        asyncio.run(shadow.arm())
+        found, _released = registrar.callbacks["company"]
+        found("company", self.CUFF_PATH)
+        found("company", "/org/bluez/hci0/dev_11_22_33_44_55_66")
+        found("ibeacon", "/org/bluez/hci0/dev_11_22_33_44_55_66")
+        rows = store.telemetry_public(True)
+        seen = [row for row in rows if row["kind"] == "monitor-seen"]
+        self.assertEqual([(row["body"]["monitor"], row["tail"]) for row in seen], [("company", "ee01")])
+        self.assertNotIn("5566", json.dumps(rows))
+        now["t"] += 3600
+        asyncio.run(shadow.tick())
+        others = [row["body"] for row in store.telemetry_public(True) if row["kind"] == "monitor-others"]
+        self.assertEqual(others, [{"company": 1, "ibeacon": 1}])
+        self.assertNotIn("5566", json.dumps(store.telemetry_public(True)))
+
+    def test_a_refusal_turns_the_shadow_off_and_unregisters_what_was_armed(self) -> None:
+        import asyncio
+
+        shadow, store, _registrar, log, now = self.make(refuse="tail")
+        asyncio.run(shadow.arm())
+        self.assertFalse(shadow.enabled)
+        self.assertIn("disarm:company", log)
+        self.assertIn("monitor-refused", self.kinds(store))
+        now["t"] += 1000
+        asyncio.run(shadow.tick())
+        self.assertEqual(log.count("arm:company"), 1)
+
+    def test_it_rearms_every_two_minutes_and_after_a_release(self) -> None:
+        import asyncio
+
+        from pressure.shadow import REARM_SECONDS
+
+        shadow, store, registrar, log, now = self.make()
+        asyncio.run(shadow.arm())
+        now["t"] += REARM_SECONDS - 1
+        asyncio.run(shadow.tick())
+        self.assertEqual(log.count("arm:company"), 1)
+        now["t"] += 1
+        asyncio.run(shadow.tick())
+        self.assertEqual(log.count("arm:company"), 2)
+        self.assertIn("disarm:company", log)
+        _found, released = registrar.callbacks["tail"]
+        released("tail")
+        self.assertNotIn("tail", shadow.handles)
+        self.assertIn("monitor-released", self.kinds(store))
+        now["t"] += REARM_SECONDS
+        asyncio.run(shadow.tick())
+        self.assertEqual(log.count("arm:tail"), 3)
+
+    def test_the_apple_shape_is_noted_once_per_run(self) -> None:
+        shadow, store, _registrar, _log, _now = self.make()
+        shadow.note_apple_shape(self.CUFF, bytes(23))
+        shadow.note_apple_shape(self.CUFF, bytes(23))
+        shapes = [row["body"] for row in store.telemetry_public(True) if row["kind"] == "apple-shape"]
+        self.assertEqual(shapes, [{"length": 23}])
+
+    def test_the_mode_file_chooses_and_defaults_to_shadow(self) -> None:
+        from pressure.shadow import scan_mode
+
+        state = Path(tempfile.mkdtemp())
+        self.assertEqual(scan_mode(state), "shadow")
+        for written, expected in (("active\n", "active"), ("shadow", "shadow"), ("passive", "shadow"), ("", "shadow")):
+            (state / "scan-mode").write_text(written, encoding="utf-8")
+            self.assertEqual(scan_mode(state), expected, written)
+
+    def test_the_listeners_step_aside_for_every_connect(self) -> None:
+        from pressure.shadow import Shadow
+
+        address = ShadowTests.CUFF
+        window = QuietScanTests.WINDOW
+
+        def trusted_window(callback, store) -> None:
+            store.trust(address, "Synthetic")
+            device = type("Device", (), {"address": address, "name": "UA-810BLE"})()
+            advert = type("Advert", (), {"manufacturer_data": window, "service_uuids": [], "local_name": ""})()
+            callback(device, advert)
+
+        result, log, store = WatchdogTests().run_radio(
+            [WatchdogTests.UP], seconds=2.0, fail_resume=True, trigger=trusted_window,
+            shadow=lambda store, log: Shadow(store, FakeRegistrar(log)),
+        )
+        self.assertEqual(result, "lost")
+        # The scanner starts (the trigger finds the window), the listeners arm, then for the connect the scanner
+        # stops and every listener is unregistered before the client is made.
+        first_stop = log.index("stop")
+        connect = log.index("connect")
+        self.assertLess(log.index("arm:ibeacon"), first_stop)
+        self.assertEqual(log[first_stop + 1:connect], ["disarm:company", "disarm:tail", "disarm:ibeacon"])
+        kinds = [row["kind"] for row in store.telemetry_public(False)]
+        self.assertIn("connect-end", kinds)
+        self.assertIn("apple-shape", kinds)
+
+    def test_the_sidecar_runs_the_shadow_unless_the_mode_file_says_active(self) -> None:
+        import asyncio
+        import types
+        from unittest import mock
+
+        import pressure.radio as radio
+        from pressure import sidecar
+
+        seen: list = []
+
+        async def loop(store, live, shadow=None) -> None:
+            seen.append(shadow)
+
+        for mode, expect_shadow in (("", True), ("active", False)):
+            store, root = _store()
+            if mode:
+                (store.state_dir / "scan-mode").write_text(mode, encoding="utf-8")
+            with mock.patch.dict("sys.modules", {"bleak": types.ModuleType("bleak")}), \
+                    mock.patch.object(radio, "radio_loop", loop):
+                asyncio.run(sidecar._radio(store, {}))
+            self.assertEqual(seen[-1] is not None, expect_shadow, mode)
+            modes = [row["body"]["mode"] for row in store.telemetry_public(False) if row["kind"] == "scan-mode"]
+            self.assertEqual(modes, ["shadow" if expect_shadow else "active"])
 
 
 if __name__ == "__main__":
