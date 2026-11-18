@@ -15,7 +15,7 @@ jobs:
       TZ: America/Toronto
     strategy:
       matrix:
-        python: ["3.12", "3.13"]
+        python: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,3 +25,17 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Sidecar self-check
         run: python pressure/sidecar.py --self-check --data "$RUNNER_TEMP/bp/data" --state "$RUNNER_TEMP/bp/state"
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Omarchy's plugin validator (Omarchy 4.0.4, pinned by commit and sha256)
+        env:
+          # The same bytes as /usr/bin/omarchy-plugin-validate in the omarchy 4.0.4-1 package.
+          VALIDATOR_URL: https://raw.githubusercontent.com/basecamp/omarchy/c668141e9c42b13c80c9ca4ea108e11708c5e8a5/bin/omarchy-plugin-validate
+          VALIDATOR_SHA256: f7507e5042eb970e3dc918bdf6bf251c7557443892a77e71a17d7019ddde72c8
+        run: |
+          curl -fsSL "$VALIDATOR_URL" -o "$RUNNER_TEMP/omarchy-plugin-validate"
+          echo "$VALIDATOR_SHA256  $RUNNER_TEMP/omarchy-plugin-validate" | sha256sum -c -
+          bash "$RUNNER_TEMP/omarchy-plugin-validate" .

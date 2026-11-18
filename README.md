@@ -59,6 +59,7 @@ flowchart LR
 - **Connect only while the light flashes.** The cuff advertises a connectable packet only in that window. The sidecar ignores its other beacons: the START burst and the idle iBeacon.
 - **Stay quiet while it sends.** The sidecar subscribes and then sends nothing until the records stop; requests between records made the cuff stop early. After that it reads the battery and the cuff clock, and sets the clock from this computer when it is more than two minutes off, such as after a daylight-saving change.
 - **Compute in Python, draw in QML.** `pressure/view.py` computes every position, so the panel draws exactly the bands it classifies with.
+- **It scans all the time.** To catch the window, the sidecar keeps a Bluetooth LE scan running, paused only while it syncs. Omarchy's shell logs every nearby device that scan stirs up into a log in RAM with no size cap: about 140 MB a day on one desk on November 18, 2026. Listening for the cuff alone (a passive scan) would end that; it is being proved in shadow first (see [`DESIGN.md`](DESIGN.md#scan-modes)).
 
 [`DESIGN.md`](DESIGN.md) records what the cuff actually does on the air, with the evidence.
 
@@ -73,31 +74,29 @@ Reports for other monitors are welcome.
 
 ## Install
 
-You need Omarchy, a Bluetooth adapter, and Python 3.12 or newer.
+You need Omarchy, a Bluetooth adapter, and Python 3.12 or newer (the sidecar refuses anything older than 3.11 and says so in the panel).
 
 ```sh
-git clone https://github.com/jmcanana/omarchy-blood-pressure
-cd omarchy-blood-pressure
+omarchy plugin add https://github.com/jmcanana/omarchy-blood-pressure.git --enable --yes
 
 # The sidecar's private Bluetooth library (no root needed).
 # Skip this and the panel shows a "Bluetooth library not installed" card with the same command to copy.
-python3 -m venv ~/.local/share/jmcanana.blood-pressure/venv
-~/.local/share/jmcanana.blood-pressure/venv/bin/pip install "bleak==3.0.2"
-
-# Load it into the shell
-rsync -a --delete --exclude .git --exclude docs ./ ~/.config/omarchy/plugins/jmcanana.blood-pressure/
-omarchy-shell shell rescanPlugins
-omarchy plugin enable jmcanana.blood-pressure --section right
+data="${XDG_DATA_HOME:-$HOME/.local/share}/jmcanana.blood-pressure"
+python3 -m venv "$data/venv"
+"$data/venv/bin/pip" install "bleak==3.0.2"
+omarchy restart shell
 ```
+
+`omarchy plugin update jmcanana.blood-pressure` shows the diff of a new version before it pulls it. A copy installed by hand (an earlier README used `rsync`) is not a git checkout and cannot be updated that way: remove it with `omarchy plugin remove jmcanana.blood-pressure` first. The database is kept.
 
 Then:
 
 1. **Clear the radio.** Turn the phone's Bluetooth off, or forget the cuff there: the cuff talks to one receiver at a time.
-2. **Pair once.** The first time, hold START on the cuff until `Pr` shows, and accept the desktop pairing prompt.
+2. **Pair once, in Omarchy's Bluetooth panel.** Hold START on the cuff until `Pr` shows, then pair `UA-810BLE` from the Bluetooth panel. The plugin itself pairs only a cuff it already trusts, and gives a pairing prompt 6 seconds.
 3. **Trust the cuff.** Click **BP** in the bar and add a patient with `+`. Take a measurement; when "New monitor nearby" appears, tap **Trust this monitor**.
 4. **Sync.** From the next measurement on, readings sync by themselves while the cuff's light flashes.
 
-To remove it, run `omarchy plugin disable jmcanana.blood-pressure`, then `omarchy plugin remove jmcanana.blood-pressure`. Your database in `~/.local/share/jmcanana.blood-pressure/` is kept. After changing the sidecar, run `omarchy restart shell`.
+To remove it, run `omarchy plugin disable jmcanana.blood-pressure`, then `omarchy plugin remove jmcanana.blood-pressure`. Your database in `${XDG_DATA_HOME:-~/.local/share}/jmcanana.blood-pressure/` is kept. After changing the sidecar, run `omarchy restart shell`. If the sidecar will not start, its errors are in `${XDG_STATE_HOME:-~/.local/state}/jmcanana.blood-pressure/sidecar.log`.
 
 ## Privacy
 
