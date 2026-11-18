@@ -12,8 +12,8 @@ BlueZ 5.87 calls DeviceFound on every matching advert for a monitor without RSSI
 trusted cuff's match is stored once per episode (EPISODE_SECONDS) per monitor, with the reports counted
 and written when the monitors are removed. Other devices are counted as distinct devices, never named.
 
-A trial is time-boxed: TRIAL_SECONDS after the first arm the monitors are removed for the rest of the
-run (`shadow-ended`), so a trial is one enable (a plugin disable and enable) per measurement. BlueZ calls
+A trial is time-boxed: TRIAL_SECONDS after the first arm the monitors are removed and scan-mode is set
+back to active (`shadow-ended`), so one `shadow` written, then a plugin disable and enable, is one trial. BlueZ calls
 Activate once the kernel has accepted a monitor's pattern; that is the positive control (`monitor-active`):
 a trial with no such row heard nothing because nothing was listening.
 
@@ -196,8 +196,15 @@ class Shadow:
         return self.trial_started is not None and self.clock() - self.trial_started >= TRIAL_SECONDS
 
     async def _end_trial(self) -> None:
+        """Remove the monitors and set the mode back to active, so a sidecar restarted after a lost scan
+        does not open a second trial: one `shadow` written is one trial."""
         await self.disarm()
         self.enabled = False
+        mode_file = Path(self.store.state_dir) / MODE_FILE
+        temporary = mode_file.with_suffix(".tmp")
+        temporary.write_text("active\n", encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        temporary.replace(mode_file)
         self.store.add_telemetry(None, "shadow-ended", {"after_seconds": round(self.clock() - self.trial_started)})
 
     def activated(self, label: str) -> None:

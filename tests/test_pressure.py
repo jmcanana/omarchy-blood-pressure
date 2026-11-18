@@ -1767,6 +1767,11 @@ class ShadowTests(unittest.TestCase):
         self.assertIn("disarm:ibeacon", log)
         asyncio.run(shadow.arm())
         self.assertEqual(log.count("arm:company"), 1)
+        # One trial per "shadow" written: the next sidecar (after a lost scan, say) runs active.
+        from pressure.shadow import scan_mode
+
+        self.assertEqual(scan_mode(store.state_dir), "active")
+        self.assertEqual(oct((store.state_dir / "scan-mode").stat().st_mode & 0o777), "0o600")
 
     def test_an_arm_after_the_box_closed_ends_the_trial_instead(self) -> None:
         import asyncio
