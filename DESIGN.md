@@ -128,7 +128,7 @@ So passive scanning is proved in shadow before it is used (`pressure/shadow.py`)
   - the adapter's `Powered` goes false then true (whether bluetoothd restores a monitor after power-on is not known);
   - BlueZ calls the monitor's `Release` (see the fallback below for when that is a loss and when a fallback);
   - the computer resumes from sleep (logind's `PrepareForSleep` false): a controller reset on resume may leave `Powered` true and call no `Release`, and whether bluetoothd puts the monitor back is not known;
-  - the adapter's object leaves the bus while bluetoothd stays up (a controller that re-enumerates, a USB adapter back under a new index). A fresh sidecar chooses the adapter again. A read that merely fails reads the same way, and costs one restart.
+  - the adapter's object leaves the bus while bluetoothd stays up (a controller that re-enumerates, a USB adapter back under a new index). A fresh sidecar chooses the adapter again. A failed or slow read alone is not a loss: only an adapter missing from BlueZ's object list counts.
 
   Signals drive all four, on one system-bus connection kept for the sidecar's life. A 10 s poll of `Powered` and of `org.bluez`'s owner stays as the backstop for a missed signal.
 - **Automatic fallback to active.** The sidecar writes `active` to `scan-mode` (0600, atomic), records `scan-mode-fallback {"reason": …}`, and exits 3, when:

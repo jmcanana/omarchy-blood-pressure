@@ -286,6 +286,9 @@ class FakeBus:
         state = self.next_state()
         return {} if state is None else {self.ADAPTER: {"org.bluez.Adapter1": {**state, "Roles": ["central"]}}}
 
+    async def object_listed(self, path: str):
+        return self.next_state() is not None
+
     async def get_all(self, path: str, interface: str):
         if interface == "org.bluez.Adapter1":
             return self.next_state()

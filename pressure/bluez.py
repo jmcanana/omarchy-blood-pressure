@@ -96,6 +96,11 @@ class SystemBus:
             return {}
         return {str(path): {name: _plain(values) for name, values in interfaces.items()} for path, interfaces in body[0].items()}
 
+    async def object_listed(self, path: str) -> bool | None:
+        """Whether BlueZ's object tree still holds `path`; None when the tree cannot be read."""
+        body = await self._call(BLUEZ, "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")
+        return None if body is None else path in body[0]
+
     async def watch(self, adapter_path: str, changed: Callable[[str, object], None]) -> None:
         """Call changed("powered", value) when the adapter's Powered changes, changed("adapter", None) for any
         other adapter property, changed("owner", new_owner) when bluetoothd's bus name changes hands, and
@@ -203,7 +208,8 @@ class Watchdog:
             return "resumed-from-sleep"
         adapter = await self.bus.get_all(self.adapter_path, ADAPTER_INTERFACE)
         if adapter is None:
-            return "adapter-gone"
+            # A read can fail or time out on a live adapter; only BlueZ's own object list says it is gone.
+            return "adapter-gone" if await self.bus.object_listed(self.adapter_path) is False else None
         powered = adapter.get("Powered")
         if powered is False:
             if not self.power_was_off:

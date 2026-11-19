@@ -250,9 +250,11 @@ class SystemBusTests(unittest.TestCase):
         async def run():
             bus = SystemBus()
             await bus.open()
-            got = (await bus.get_all("/org/bluez/hci0", "org.bluez.Adapter1"), await bus.name_owner(), await bus.managed_objects())
+            got = (await bus.get_all("/org/bluez/hci0", "org.bluez.Adapter1"), await bus.name_owner(), await bus.managed_objects(),
+                   await bus.object_listed("/org/bluez/hci0"), await bus.object_listed("/org/bluez/hci1"))
             replies.update({"GetAll": None, "GetNameOwner": RuntimeError("gone"), "GetManagedObjects": None})
-            missing = (await bus.get_all("/x", "y"), await bus.name_owner(), await bus.managed_objects())
+            missing = (await bus.get_all("/x", "y"), await bus.name_owner(), await bus.managed_objects(),
+                       await bus.object_listed("/org/bluez/hci0"))
             bus.close()
             bus.close()
             return got, missing, bus
@@ -262,7 +264,8 @@ class SystemBusTests(unittest.TestCase):
         self.assertEqual(got[0], {"Powered": True, "Discovering": False})
         self.assertEqual(got[1], ":1.7")
         self.assertEqual(got[2], {"/org/bluez/hci0": {"org.bluez.Adapter1": {"Powered": True}}})
-        self.assertEqual(missing, (None, None, {}))
+        self.assertEqual(got[3:], (True, False))
+        self.assertEqual(missing, (None, None, {}, None))
         self.assertTrue(made.made[-1].disconnected)
         self.assertIsNone(bus.bus)
 
@@ -311,7 +314,11 @@ class StubBus:
     def __init__(self) -> None:
         self.owner = ":1.7"
         self.adapter = {"Powered": True, "Discovering": True}
+        self.listed: bool | None = True
         self.changed = None
+
+    async def object_listed(self, _path):
+        return self.listed
 
     async def name_owner(self):
         return self.owner
@@ -368,7 +375,15 @@ class WatchdogRuleTests(unittest.TestCase):
         for passive in (True, False):
             watchdog, bus, _wake, _now = self.make()
             bus.adapter = None
+            bus.listed = False
             self.assertEqual(self.loss(watchdog, passive), "adapter-gone")
+
+    def test_a_failed_read_of_a_listed_or_unknown_adapter_is_not_a_loss(self) -> None:
+        for listed in (True, None):
+            watchdog, bus, _wake, _now = self.make()
+            bus.adapter = None
+            bus.listed = listed
+            self.assertIsNone(self.loss(watchdog, True), listed)
 
     def test_a_resume_from_sleep_is_a_loss(self) -> None:
         watchdog, bus, wake, _now = self.make()
