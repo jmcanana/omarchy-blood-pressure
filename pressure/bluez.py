@@ -15,8 +15,8 @@ BUS_NAME = "org.freedesktop.DBus"
 LOGIN_MANAGER = "org.freedesktop.login1.Manager"
 BUS_CALL_SECONDS = 2.0
 # A Release that comes this close to an owner change or a power cycle is part of that loss, not a reason
-# to give up on listening.
-RELEASE_GRACE_SECONDS = 10.0
+# to give up on listening. 20 s, not 10: a power-off missed as a signal is stamped by the next 10 s poll.
+RELEASE_GRACE_SECONDS = 20.0
 
 
 def _path_order(path: str) -> tuple[int, str]:
@@ -192,7 +192,8 @@ class Watchdog:
 
     async def loss(self, passive: bool) -> str | None:
         """The reason the scan or listening is lost, or None. A bluetoothd that is down or an adapter that is
-        off is not a loss yet: a fresh sidecar could do no better until they are back."""
+        off is not a loss yet: a fresh sidecar could do no better until they are back. An adapter that has left
+        the bus while bluetoothd stays up is: a fresh sidecar chooses again."""
         owner = await self.bus.name_owner()
         if owner is None:
             return None
@@ -201,7 +202,9 @@ class Watchdog:
         if self.resumed:
             return "resumed-from-sleep"
         adapter = await self.bus.get_all(self.adapter_path, ADAPTER_INTERFACE)
-        powered = (adapter or {}).get("Powered")
+        if adapter is None:
+            return "adapter-gone"
+        powered = adapter.get("Powered")
         if powered is False:
             if not self.power_was_off:
                 self.disturbed_at = self.clock()

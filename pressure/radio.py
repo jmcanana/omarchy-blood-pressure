@@ -271,7 +271,13 @@ async def radio_loop(
                     continue
                 seen = target.pop("sighting")
                 kind = target.pop("kind", "transfer")
-                await _sync(store, live, seen, kind, adapter, listener, shadow, BleakClient)
+                try:
+                    await _sync(store, live, seen, kind, adapter, listener, shadow, BleakClient)
+                except Exception:
+                    # The connect itself never raises; something around it did. Count it, so a fault that repeats
+                    # here reaches the passive loss rule instead of restarting the sidecar for ever.
+                    store.add_telemetry(None, "scan-lost", {"mode": mode, "reason": "sync-error"})
+                    raise
                 start_heard_at = None
                 await _resume_listening(store, live, listener, passive)
                 if shadow is not None:
@@ -385,6 +391,9 @@ async def _sync(store: Store, live: dict, seen: Sighting, kind: str, adapter: st
                 store.add_telemetry(address, "drain", {"cuff_released": result["cuff_released"]})
                 store.record_sync(result["stored"])
                 store.update_device(address, name=seen.name, mtu=getattr(client, "mtu_size", None))
+                if kind == "transfer" and not store.trusted_beacon(address):
+                    # Trusted before the beacon was kept: this window shows it is a cuff, which passive needs.
+                    store.trust(address, beacon="transfer")
     except TimeoutError:
         outcome = "timeout"
         live.update(state="scanning", link=False, error="timed out")

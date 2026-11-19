@@ -311,6 +311,7 @@ class WatchdogTests(unittest.TestCase):
         self, states: list, seconds: float = 0.5, fail_resume: bool = False, trigger=None, shadow=None,
         mode: str = "", bus=None, registrar=None, connect_error: BaseException | None = None,
         prepare=None, check_seconds: float = 0.01, client=None, fail_stop: bool = False, synced: bool = False,
+        clock_error: BaseException | None = None,
     ):
         import asyncio
         import types
@@ -354,6 +355,8 @@ class WatchdogTests(unittest.TestCase):
                 return None
 
         async def unsynced() -> bool:
+            if clock_error:
+                raise clock_error
             return synced
 
         bleak = types.ModuleType("bleak")
@@ -391,10 +394,16 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn("scan-lost", [row["kind"] for row in store.telemetry_public(False)])
 
     def test_a_healthy_or_unavailable_adapter_keeps_waiting(self) -> None:
-        for later in (self.UP, self.OFF, None):
+        for later in (self.UP, self.OFF):
             result, log, _store_ = self.run_radio([self.UP, later], seconds=0.2)
             self.assertEqual(result, "kept-scanning", later)
             self.assertGreater(log.count("ask"), 3)
+
+    def test_an_adapter_that_left_the_bus_is_a_loss(self) -> None:
+        result, _log, store = self.run_radio([self.UP, None], seconds=0.5)
+        self.assertEqual(result, "lost")
+        self.assertEqual([row["body"] for row in store.telemetry_public(False) if row["kind"] == "scan-lost"],
+                         [{"mode": "active", "reason": "adapter-gone"}])
 
     def test_the_scan_starts_only_once_the_adapter_is_powered(self) -> None:
         result, log, _store_ = self.run_radio([None, self.OFF, self.UP], seconds=0.2)

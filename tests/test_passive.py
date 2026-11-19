@@ -364,6 +364,12 @@ class WatchdogRuleTests(unittest.TestCase):
         bus.changed("adapter", None)
         self.assertIsNone(self.loss(watchdog, True))
 
+    def test_an_adapter_gone_from_the_bus_is_a_loss_in_both_modes(self) -> None:
+        for passive in (True, False):
+            watchdog, bus, _wake, _now = self.make()
+            bus.adapter = None
+            self.assertEqual(self.loss(watchdog, passive), "adapter-gone")
+
     def test_a_resume_from_sleep_is_a_loss(self) -> None:
         watchdog, bus, wake, _now = self.make()
         bus.changed("sleep", True)
@@ -678,6 +684,8 @@ class ModeChoiceTests(unittest.TestCase):
         (store.state_dir / "scan-mode").write_text("passive\n", encoding="utf-8")
         self.assertEqual(choose_mode(store), ("active", {"mode": "active", "wanted": "passive", "why": "no-trusted-cuff"}))
         store.trust("aa:00:00:00:00:01", "Old cuff")
+        self.assertEqual(choose_mode(store), ("active", {"mode": "active", "wanted": "passive", "why": "beacon-unknown"}))
+        store.trust("aa:00:00:00:00:01", beacon="transfer")
         self.assertEqual(choose_mode(store), ("passive", {"mode": "passive"}))
         store.trust("aa:00:00:00:00:02", "Cuff", beacon="transfer")
         self.assertEqual(choose_mode(store)[0], "passive")
@@ -909,6 +917,8 @@ class ConnectPathTests(unittest.TestCase):
         self.assertEqual(result, "kept-scanning")
         # Unsynchronized, the clock is never written (no source); synchronized, it is offered.
         self.assertEqual(log, ["connect", "drain:True", "connect", "drain:False"])
+        # The window sync records the beacon of a cuff trusted without one, so passive can use it.
+        self.assertEqual(store.trusted_beacon(CUFF), "transfer")
         self.assertEqual(bodies(store, "connect-end")[-1]["outcome"], "ok")
         self.assertIn("disconnect", kinds(store))
         self.assertGreaterEqual(run_log.count("start"), 2)
@@ -965,6 +975,75 @@ class ConnectPathTests(unittest.TestCase):
         )
         self.assertTrue(ticks)
         self.assertGreaterEqual(log.count("arm:company"), 2)
+
+
+class SyncErrorTests(unittest.TestCase):
+    def test_an_error_around_the_connect_is_a_counted_loss(self) -> None:
+        def armed(found, _released, bus, store):
+            store.trust(CUFF, "Synthetic")
+            bus.devices[CUFF_PATH] = device1(WINDOW)
+            found("passive", CUFF_PATH)
+
+        store_holder: list = []
+
+        def keep(store):
+            store_holder.append(store)
+
+        with self.assertRaises(OSError):
+            run_passive(armed, seed=keep, seconds=0.5, clock_error=OSError("timedate1 went away"))
+        self.assertEqual(bodies(store_holder[0], "scan-lost"), [{"mode": "passive", "reason": "sync-error"}])
+        self.assertNotIn("connect-start", kinds(store_holder[0]))
+
+
+class OwnStopTests(unittest.TestCase):
+    def test_the_scans_own_stop_around_a_connect_is_not_a_loss(self) -> None:
+        """While the sidecar connects its own scan is stopped, so Discovering reads false and a signal says so;
+        just after the scan starts again it may still read false for a moment. Neither may end the run."""
+        import time as clock
+
+        import pressure.radio as radio
+
+        made: dict = {}
+
+        class LagBus(FakeBus):
+            def __init__(self, states, log) -> None:
+                super().__init__(states, log)
+                self.connecting = False
+                self.ended = -1.0
+                made["bus"] = self
+
+            def next_state(self):
+                self.log.append("ask")
+                lagging = self.connecting or clock.monotonic() - self.ended < 0.15
+                return WatchdogTests.LOST if lagging else WatchdogTests.UP
+
+        class Client:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                made["bus"].connecting = True
+                made["bus"].changed("adapter", None)
+                return types.SimpleNamespace(is_connected=True, mtu_size=185, pair=self.paired)
+
+            async def paired(self) -> None:
+                return None
+
+            async def __aexit__(self, *_exc) -> None:
+                made["bus"].connecting = False
+                made["bus"].ended = clock.monotonic()
+
+        async def drained(_link, _store, _address, clock_source=None):
+            return {"cuff_released": True, "stored": 1}
+
+        trigger = ConnectPathTests().window()
+        with mock.patch.object(radio, "drain", drained):
+            result, _log, store = WatchdogTests().run_radio(
+                [WatchdogTests.UP], seconds=0.8, trigger=trigger, client=Client, bus=LagBus, check_seconds=0.3
+            )
+        self.assertEqual(result, "kept-scanning")
+        self.assertEqual(bodies(store, "connect-end")[-1]["outcome"], "ok")
+        self.assertNotIn("scan-lost", kinds(store))
 
 
 class StopTests(unittest.TestCase):

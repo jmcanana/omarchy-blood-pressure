@@ -52,7 +52,9 @@ LEDGER_KEEP = 64
 
 class CommandLedger:
     """The ids of the changes the sidecar has run, with each one's outcome, in a private file that outlives a
-    restart. The panel re-sends an unanswered command with the same id, so this is what makes a change run once."""
+    restart. The panel re-sends an unanswered command with the same id, so this is what makes a change run once.
+    A replay carries `ok` and `error` only, not the change's other fields (an added patient's id, a trusted
+    cuff's tail): today's panel reads none of them and asks for a fresh summary after any change."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -243,14 +245,16 @@ async def _radio(store: Store, live: dict) -> None:
 def choose_mode(store: Store) -> tuple[str, dict]:
     """The mode this run uses, and its telemetry row. Passive needs a trusted cuff and only cuffs trusted from
     the window: a generic monitor's advert cannot be matched passively, and with no cuff there is nothing to
-    listen for."""
+    listen for. A device trusted before the beacon was kept ("") counts once a window sync has recorded it."""
     from pressure.shadow import scan_mode
 
     wanted = scan_mode(store.state_dir)
     if wanted != "passive":
         return wanted, {"mode": wanted}
     beacons = store.trusted_beacons()
-    why = "no-trusted-cuff" if not beacons else ("generic-monitor" if "generic" in beacons else "")
+    why = "no-trusted-cuff" if not beacons else ""
+    if beacons and set(beacons) != {"transfer"}:
+        why = "generic-monitor" if "generic" in beacons else "beacon-unknown"
     if why:
         return "active", {"mode": "active", "wanted": "passive", "why": why}
     return "passive", {"mode": "passive"}
