@@ -45,12 +45,65 @@ def _dirs(args: argparse.Namespace) -> tuple[Path, Path]:
     return data, state
 
 
+# Commands that only read. A re-sent read runs again; a re-sent change never does.
+READ_OPS = frozenset({"summary", "patients", "seen", "telemetry"})
+LEDGER_KEEP = 64
+
+
+class CommandLedger:
+    """The ids of the changes the sidecar has run, with each one's outcome, in a private file that outlives a
+    restart. The panel re-sends an unanswered command with the same id, so this is what makes a change run once."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        try:
+            entries = json.loads(path.read_text(encoding="utf-8"))
+            self.entries = [(str(cid), {"ok": bool(ok), "error": str(error)}) for cid, ok, error in entries]
+        except (OSError, ValueError, TypeError):
+            self.entries = []
+
+    def outcome(self, command_id: str) -> dict | None:
+        for cid, outcome in reversed(self.entries):
+            if cid == command_id:
+                return outcome
+        return None
+
+    def record(self, command_id: str, body: dict) -> None:
+        outcome = {"ok": bool(body.get("ok")), "error": str(body.get("error", ""))}
+        self.entries = (self.entries + [(command_id, outcome)])[-LEDGER_KEEP:]
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps([[cid, kept["ok"], kept["error"]] for cid, kept in self.entries]), encoding="utf-8"
+        )
+        os.chmod(temporary, 0o600)
+        temporary.replace(self.path)
+
+
+def _run_command(store: Store, ledger: CommandLedger, command: dict) -> dict:
+    """One command's response body. A change whose id has run before answers its recorded outcome instead."""
+    command_id = str(command.get("id", ""))
+    changes = command.get("op") not in READ_OPS
+    earlier = ledger.outcome(command_id) if command_id and changes else None
+    if earlier is not None:
+        return {**earlier, "repeated": True}
+    try:
+        body = handle(store, command)
+    except ValueError as exc:
+        body = {"ok": False, "error": str(exc)[:80]}
+    except Exception:
+        body = {"ok": False, "error": "command failed"}
+    if command_id and changes:
+        ledger.record(command_id, body)
+    return body
+
+
 async def _commands_clean(store: Store, state: Path, live: dict) -> None:
     """Handle the panel's command file. Claiming it with a rename first means a command written
     while the previous one is being handled is never deleted unread."""
     command_path = state / "command.json"
     claimed_path = state / "command.claimed"
     response_path = state / "response.json"
+    ledger = CommandLedger(state / "commands.done")
     while True:
         # Keep the directory 0700 even if something recreated it; a claim left by a crash is
         # handled before any new command.
@@ -64,11 +117,11 @@ async def _commands_clean(store: Store, state: Path, live: dict) -> None:
         command: dict = {}
         try:
             command = json.loads(claimed_path.read_text(encoding="utf-8"))
-            body = handle(store, command)
-        except ValueError as exc:
-            body = {"ok": False, "error": str(exc)[:80]}
-        except Exception:
-            body = {"ok": False, "error": "command failed"}
+        except ValueError:
+            body = {"ok": False, "error": "command was not JSON"}
+        else:
+            body = _run_command(store, ledger, command if isinstance(command, dict) else {})
+            command = command if isinstance(command, dict) else {}
         claimed_path.unlink(missing_ok=True)
         write_response(response_path, str(command.get("id", "")), body)
         store.write_status(
@@ -179,13 +232,28 @@ async def _radio(store: Store, live: dict) -> None:
         live.update(state="setup", error=BLEAK_MISSING)
         store.write_status(state="setup", beacon="none", link=False, error=BLEAK_MISSING)
         return
-    from pressure.radio import ADAPTER_PATH, radio_loop
-    from pressure.shadow import BluezRegistrar, Shadow, scan_mode
+    from pressure.radio import radio_loop
 
-    mode = scan_mode(store.state_dir)
-    store.add_telemetry(None, "scan-mode", {"mode": mode})
-    shadow = Shadow(store, BluezRegistrar(ADAPTER_PATH)) if mode == "shadow" else None
-    await radio_loop(store, live, shadow)
+    mode, row = choose_mode(store)
+    store.add_telemetry(None, "scan-mode", row)
+    store.scan_mode = mode
+    await radio_loop(store, live, mode)
+
+
+def choose_mode(store: Store) -> tuple[str, dict]:
+    """The mode this run uses, and its telemetry row. Passive needs a trusted cuff and only cuffs trusted from
+    the window: a generic monitor's advert cannot be matched passively, and with no cuff there is nothing to
+    listen for."""
+    from pressure.shadow import scan_mode
+
+    wanted = scan_mode(store.state_dir)
+    if wanted != "passive":
+        return wanted, {"mode": wanted}
+    beacons = store.trusted_beacons()
+    why = "no-trusted-cuff" if not beacons else ("generic-monitor" if "generic" in beacons else "")
+    if why:
+        return "active", {"mode": "active", "wanted": "passive", "why": why}
+    return "passive", {"mode": "passive"}
 
 
 def self_check(data: Path, state: Path) -> None:

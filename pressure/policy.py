@@ -42,6 +42,11 @@ def beacon_class(mfg: dict | None) -> str:
     return "generic"
 
 
+def starts_measurement(mfg: dict | None) -> bool:
+    """The START burst's company-105 payload, whatever stale Apple value BlueZ holds beside it."""
+    return _hex(mfg or {}, AAND_D_COMPANY).startswith("01")
+
+
 def advertises_blood_pressure(service_uuids: list[str] | None) -> bool:
     for uuid in service_uuids or []:
         compact = uuid.lower().replace("-", "")

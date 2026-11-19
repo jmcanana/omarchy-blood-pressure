@@ -53,16 +53,25 @@ EPISODE_SECONDS = 300.0
 BLUEZ_CALL_SECONDS = 1.0
 OTHERS_REPORT_SECONDS = 3600.0
 MODE_FILE = "scan-mode"
-MODES = ("active", "shadow")
+MODES = ("active", "shadow", "passive")
 
 
 def scan_mode(state_dir: Path) -> str:
-    """The scan mode from the state directory's scan-mode file: active unless it says shadow."""
+    """The scan mode from the state directory's scan-mode file: active unless it names another mode."""
     try:
         chosen = (Path(state_dir) / MODE_FILE).read_text(encoding="utf-8").strip()
     except OSError:
         return "active"
     return chosen if chosen in MODES else "active"
+
+
+def set_scan_mode(state_dir: Path, mode: str) -> None:
+    """Replace the scan-mode file atomically, private to this user."""
+    mode_file = Path(state_dir) / MODE_FILE
+    temporary = mode_file.with_suffix(".tmp")
+    temporary.write_text(f"{mode}\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    temporary.replace(mode_file)
 
 
 def address_from_path(path: str) -> str:
@@ -82,24 +91,27 @@ class MonitorRefused(RuntimeError):
 
 
 class BluezRegistrar:
-    """Registers monitors with org.bluez.AdvertisementMonitorManager1 on its own system-bus connection,
-    the way bleak 3.0.2 registers its passive scanner's monitor (register, then export)."""
+    """Registers monitors with org.bluez.AdvertisementMonitorManager1, the way bleak 3.0.2 registers its
+    passive scanner's monitor (register, then export): on its own system-bus connection, or on `bus`, an open
+    connection it borrows and never closes."""
 
-    def __init__(self, adapter_path: str) -> None:
+    def __init__(self, adapter_path: str, bus=None) -> None:
         self.adapter_path = adapter_path
-        self.bus = None
+        self.bus = bus
+        self.borrowed = bus is not None
         # A fresh object path per registration: BlueZ may still hold an old one (AlreadyExists).
         self.serial = 0
 
     async def open(self) -> None:
+        if self.bus is not None:
+            return
         from dbus_fast import BusType
         from dbus_fast.aio import MessageBus
 
         self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
-    async def register(
-        self, label: str, pattern: tuple[int, int, bytes], found: Callable, released: Callable, activated: Callable
-    ):
+    async def register(self, label: str, pattern, found: Callable, released: Callable, activated: Callable):
+        """`pattern` is one (offset, AD type, bytes) or a list of them, which BlueZ ORs."""
         from dbus_fast import Message, MessageType
         from dbus_fast.service import method
 
@@ -122,7 +134,7 @@ class BluezRegistrar:
             def DeviceLost(self, device: "o"):  # noqa: F821, N802
                 return None
 
-        monitor = Monitor([pattern])
+        monitor = Monitor(pattern if isinstance(pattern, list) else [pattern])
         self.serial += 1
         path = f"/org/jmcanana/bloodpressure/{os.getpid()}/{label}{self.serial}"
         reply = await self.bus.call(
@@ -157,7 +169,7 @@ class BluezRegistrar:
         )
 
     async def close(self) -> None:
-        if self.bus is not None:
+        if self.bus is not None and not self.borrowed:
             self.bus.disconnect()
             self.bus = None
 
@@ -200,11 +212,7 @@ class Shadow:
         does not open a second trial: one `shadow` written is one trial."""
         await self.disarm()
         self.enabled = False
-        mode_file = Path(self.store.state_dir) / MODE_FILE
-        temporary = mode_file.with_suffix(".tmp")
-        temporary.write_text("active\n", encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        temporary.replace(mode_file)
+        set_scan_mode(self.store.state_dir, "active")
         self.store.add_telemetry(None, "shadow-ended", {"after_seconds": round(self.clock() - self.trial_started)})
 
     def activated(self, label: str) -> None:

@@ -255,6 +255,51 @@ class ClockTests(unittest.TestCase):
             asyncio.run(_BleakLink(Client(RuntimeError("Authentication Failed"))).pair())
 
 
+class FakeBus:
+    """Stands in for bluez.SystemBus: one adapter whose properties are read from `states` in order (the last
+    repeats; None means bluetoothd has no adapter yet), a bluetoothd owner, Device1 properties by path, and
+    the signal callback the watchdog registers."""
+
+    ADAPTER = "/org/bluez/hci0"
+
+    def __init__(self, states: list, log: list[str], owner: str | None = ":1.7") -> None:
+        self.states = states
+        self.log = log
+        self.owner = owner
+        self.asked = 0
+        self.devices: dict[str, dict] = {}
+        self.changed = None
+        self.bus = object()
+
+    def next_state(self):
+        self.asked += 1
+        self.log.append("ask")
+        return self.states[min(self.asked, len(self.states)) - 1]
+
+    async def open(self) -> None:
+        self.log.append("bus-open")
+
+    def close(self) -> None:
+        self.log.append("bus-close")
+
+    async def managed_objects(self) -> dict:
+        state = self.next_state()
+        return {} if state is None else {self.ADAPTER: {"org.bluez.Adapter1": {**state, "Roles": ["central"]}}}
+
+    async def get_all(self, path: str, interface: str):
+        if interface == "org.bluez.Adapter1":
+            return self.next_state()
+        self.log.append(f"read:{path}")
+        return self.devices.get(path)
+
+    async def name_owner(self):
+        return self.owner
+
+    async def watch(self, adapter_path: str, changed) -> None:
+        self.log.append(f"watch:{adapter_path}")
+        self.changed = changed
+
+
 class WatchdogTests(unittest.TestCase):
     """The sidecar must exit, so Service.qml starts a fresh one, when its scan ends underneath it."""
 
@@ -262,7 +307,11 @@ class WatchdogTests(unittest.TestCase):
     LOST = {"Powered": True, "Discovering": False}
     OFF = {"Powered": False, "Discovering": False}
 
-    def run_radio(self, states: list, seconds: float = 0.5, fail_resume: bool = False, trigger=None, shadow=None):
+    def run_radio(
+        self, states: list, seconds: float = 0.5, fail_resume: bool = False, trigger=None, shadow=None,
+        mode: str = "", bus=None, registrar=None, connect_error: BaseException | None = None,
+        prepare=None, check_seconds: float = 0.01, client=None, fail_stop: bool = False, synced: bool = False,
+    ):
         import asyncio
         import types
         from unittest import mock
@@ -270,12 +319,16 @@ class WatchdogTests(unittest.TestCase):
         import pressure.radio as radio
 
         store, _root = _store()
+        if prepare:
+            prepare(store)
         log: list[str] = []
-        asked = {"count": 0}
+        made_bus = bus(states, log) if bus else FakeBus(states, log)
+        self.bus = made_bus
 
         class Scanner:
-            def __init__(self, detection_callback) -> None:
+            def __init__(self, detection_callback, bluez=None) -> None:
                 self.callback = detection_callback
+                log.append(f"scanner:{(bluez or {}).get('adapter')}")
 
             async def start(self) -> None:
                 if fail_resume and "start" in log:
@@ -286,38 +339,38 @@ class WatchdogTests(unittest.TestCase):
 
             async def stop(self) -> None:
                 log.append("stop")
+                if fail_stop:
+                    raise RuntimeError("org.bluez.Error.Failed")
 
         class Client:
-            def __init__(self, *_args, **_kwargs) -> None:
-                pass
+            def __init__(self, *_args, **kwargs) -> None:
+                log.append(f"client:{(kwargs.get('bluez') or {}).get('adapter')}")
 
             async def __aenter__(self):
                 log.append("connect")
-                raise RuntimeError("le-connection-abort-by-local")
+                raise connect_error or RuntimeError("le-connection-abort-by-local")
 
             async def __aexit__(self, *_exc) -> None:
                 return None
 
-        async def states_in_order():
-            asked["count"] += 1
-            log.append("ask")
-            return states[min(asked["count"], len(states)) - 1]
-
         async def unsynced() -> bool:
-            return False
+            return synced
 
         bleak = types.ModuleType("bleak")
         bleak.BleakScanner = Scanner
-        bleak.BleakClient = Client
+        bleak.BleakClient = client or Client
+        chosen = mode or ("shadow" if shadow else "active")
         with (
             mock.patch.dict("sys.modules", {"bleak": bleak}),
-            mock.patch.object(radio, "adapter_state", states_in_order),
             mock.patch.object(radio, "computer_clock_synced", unsynced),
-            mock.patch.object(radio, "SCAN_CHECK_SECONDS", 0.01),
+            mock.patch.object(radio, "SCAN_CHECK_SECONDS", check_seconds),
         ):
             try:
-                made = shadow(store, log) if shadow else None
-                asyncio.run(asyncio.wait_for(radio.radio_loop(store, {}, made), seconds))
+                asyncio.run(asyncio.wait_for(radio.radio_loop(
+                    store, {}, chosen, made_bus,
+                    (lambda _path, _bus: shadow(store, log)) if shadow else None,
+                    (lambda _path, _bus: registrar(store, log, made_bus)) if registrar else None,
+                ), seconds))
             except TimeoutError:
                 return "kept-scanning", log, store
             except radio.ScanLost:
@@ -325,13 +378,11 @@ class WatchdogTests(unittest.TestCase):
         return "returned", log, store
 
     def test_verdicts(self) -> None:
-        from pressure.radio import adapter_ready, scan_lost
+        from pressure.bluez import scan_lost
 
         self.assertTrue(scan_lost(self.LOST))
         for adapter in (None, {}, self.UP, self.OFF, {"Powered": True}):
             self.assertFalse(scan_lost(adapter), adapter)
-        self.assertTrue(adapter_ready(self.UP) and adapter_ready(self.LOST))
-        self.assertFalse(adapter_ready(None) or adapter_ready(self.OFF))
 
     def test_a_lost_scan_ends_the_radio_with_telemetry(self) -> None:
         result, log, store = self.run_radio([self.UP, self.UP, self.UP, self.LOST])
@@ -348,7 +399,7 @@ class WatchdogTests(unittest.TestCase):
     def test_the_scan_starts_only_once_the_adapter_is_powered(self) -> None:
         result, log, _store_ = self.run_radio([None, self.OFF, self.UP], seconds=0.2)
         self.assertEqual(result, "kept-scanning")
-        self.assertEqual(log[:4], ["ask", "ask", "ask", "start"])
+        self.assertEqual([entry for entry in log if entry in {"ask", "start"}][:4], ["ask", "ask", "ask", "start"])
 
     def test_a_scan_that_will_not_resume_after_a_sync_ends_the_radio(self) -> None:
         address = "aa:bb:cc:dd:ee:01"
@@ -621,7 +672,7 @@ class PanelPrivacyTests(unittest.TestCase):
         self.assertEqual(blocks, self.PROCESS_BLOCKS)
         panel = sources[root / "Panel.qml"]
         self.assertIn("commandFile.setText(JSON.stringify(body))", panel)
-        self.assertIn('    body.id = root.sessionTag + "-" + root.commandId\n', panel)
+        self.assertIn('      body.id = root.sessionTag + "-" + root.commandId\n', panel)
         # The two definitions the allowlisted command lines use, pinned exactly.
         self.assertIn('  readonly property string sharePath: root.stateDir + "/pressure-share.png"\n', panel)
         self.assertIn(
@@ -1799,7 +1850,7 @@ class ShadowTests(unittest.TestCase):
 
         state = Path(tempfile.mkdtemp())
         self.assertEqual(scan_mode(state), "active")
-        for written, expected in (("shadow\n", "shadow"), ("active", "active"), ("passive", "active"), ("", "active")):
+        for written, expected in (("shadow\n", "shadow"), ("active", "active"), ("passive", "passive"), ("quiet", "active"), ("", "active")):
             (state / "scan-mode").write_text(written, encoding="utf-8")
             self.assertEqual(scan_mode(state), expected, written)
 
@@ -1823,7 +1874,7 @@ class ShadowTests(unittest.TestCase):
         # The scanner starts (the trigger finds the window), the listeners arm, then for the connect the scanner
         # stops and every listener is unregistered before the client is made.
         first_stop = log.index("stop")
-        connect = log.index("connect")
+        connect = log.index("client:hci0")
         self.assertLess(log.index("arm:ibeacon"), first_stop)
         self.assertEqual(log[first_stop + 1:connect], ["disarm:company", "disarm:window", "disarm:tail", "disarm:ibeacon"])
         kinds = [row["kind"] for row in store.telemetry_public(False)]
@@ -1840,19 +1891,20 @@ class ShadowTests(unittest.TestCase):
 
         seen: list = []
 
-        async def loop(store, live, shadow=None) -> None:
-            seen.append(shadow)
+        async def loop(store, live, mode="active") -> None:
+            seen.append(mode)
 
-        for mode, expect_shadow in (("", False), ("active", False), ("shadow", True)):
+        for written, expected in (("", "active"), ("active", "active"), ("shadow", "shadow")):
             store, root = _store()
-            if mode:
-                (store.state_dir / "scan-mode").write_text(mode, encoding="utf-8")
+            if written:
+                (store.state_dir / "scan-mode").write_text(written, encoding="utf-8")
             with mock.patch.dict("sys.modules", {"bleak": types.ModuleType("bleak")}), \
                     mock.patch.object(radio, "radio_loop", loop):
                 asyncio.run(sidecar._radio(store, {}))
-            self.assertEqual(seen[-1] is not None, expect_shadow, mode)
+            self.assertEqual(seen[-1], expected, written)
+            self.assertEqual(store.scan_mode, expected)
             modes = [row["body"]["mode"] for row in store.telemetry_public(False) if row["kind"] == "scan-mode"]
-            self.assertEqual(modes, ["shadow" if expect_shadow else "active"])
+            self.assertEqual(modes, [expected])
 
 
 if __name__ == "__main__":

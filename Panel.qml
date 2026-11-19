@@ -16,6 +16,9 @@ Panel {
   property var hostWidget: null
   property var summary: ({})
   property string linkState: "idle"
+  // How the sidecar listens, from status.json; named in the device strip.
+  property string scanMode: ""
+  readonly property string scanLabel: ({ active: "Full scan", passive: "Quiet listening", shadow: "Shadow trial" })[root.scanMode] || ""
   property int commandId: 1
   // Ids are unique per session, so a response.json left by an earlier session never matches.
   readonly property string sessionTag: String(Date.now())
@@ -84,6 +87,12 @@ Panel {
   // each after the previous response. Anything that changes data is followed by a fresh summary.
   property var queue: []
   property string inflight: ""
+  // The command waiting for its response. Kept so the 4 s guard can send it again, with the same id, rather
+  // than drop it: a different command written over it before the sidecar read it would be lost.
+  property var inflightBody: null
+  // 4 s for a new command; each re-send of the same one waits twice as long, up to 32 s, so a sidecar that is
+  // restarting (4 s, longer when it backs off) is not met by a rewrite every time it starts.
+  property int guardDelay: 4000
   property bool dirty: false
   function command(op, extra) {
     var body = extra || {}
@@ -104,9 +113,14 @@ Panel {
     if (!root.sidecarSeen || root.inflight !== "" || root.queue.length === 0) return
     var body = root.queue[0]
     root.queue = root.queue.slice(1)
-    body.id = root.sessionTag + "-" + root.commandId
-    root.commandId += 1
+    if (!body.id) {
+      body.id = root.sessionTag + "-" + root.commandId
+      root.commandId += 1
+      root.guardDelay = 4000
+    }
     root.inflight = body.id
+    root.inflightBody = body
+    flushGuard.interval = root.guardDelay
     flushGuard.restart()
     // Written straight to the private state directory: no process, so nothing (patient names
     // included) appears on a command line that other local users could list.
@@ -121,6 +135,7 @@ Panel {
     try { doc = JSON.parse(raw || "{}") } catch (error) { return }
     if (!doc || String(doc.id) !== root.inflight) return
     root.inflight = ""
+    root.inflightBody = null
     if (doc.hero !== undefined) root.summary = doc
     if (root.queue.length === 0 && root.dirty) {
       root.dirty = false
@@ -899,9 +914,9 @@ Panel {
               Text {
                 anchors.verticalCenter: parent.verticalCenter
                 textFormat: Text.PlainText
-                text: root.monitor
+                text: (root.monitor
                   ? ((root.monitor.battery !== null && root.monitor.battery !== undefined ? "▮ " + root.monitor.battery + " %   " : "") + (root.monitor.model || "Monitor") + (root.monitor.firmware ? " · fw " + root.monitor.firmware : ""))
-                  : "No monitor trusted yet"
+                  : "No monitor trusted yet") + (root.scanLabel ? " · " + root.scanLabel : "")
                 color: root.ink2
                 font.family: root.family
                 font.pixelSize: Style.font.caption
@@ -1004,6 +1019,7 @@ Panel {
       try { doc = JSON.parse(text() || "{}") } catch (error) { return }
       var previous = root.linkState
       root.linkState = doc.state || "idle"
+      root.scanMode = doc.scan || ""
       root.setupError = root.linkState === "setup" ? String(doc.error || "") : ""
       if (previous !== root.linkState && root.opened) root.askSummary()
     }
@@ -1017,11 +1033,20 @@ Panel {
     onLoaded: root.applyResponse(text())
   }
 
-  // A response that never arrives (sidecar restarting) must not wedge the queue.
+  // A response that never arrives (sidecar restarting) must not wedge the queue, nor lose what was sent:
+  // send it again, same id, ahead of the rest. The sidecar runs a change id at most once.
   Timer {
     id: flushGuard
     interval: 4000
-    onTriggered: { root.inflight = ""; root.dispatch() }
+    onTriggered: {
+      if (root.inflightBody) {
+        root.queue = [root.inflightBody].concat(root.queue)
+        root.guardDelay = Math.min(root.guardDelay * 2, 32000)
+      }
+      root.inflight = ""
+      root.inflightBody = null
+      root.dispatch()
+    }
   }
 
   Timer {

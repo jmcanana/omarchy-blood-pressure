@@ -9,7 +9,7 @@ import json
 import os
 import sqlite3
 import stat
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pressure.blp import mmhg, status_bits
@@ -27,6 +27,7 @@ STATUS_KEYS = (
     "link",
     "error",
     "trusted",
+    "scan",
 )
 
 
@@ -79,6 +80,8 @@ class Store:
         self.status_path = self.state_dir / "status.json"
         # The state last written to status.json, so a repeating advert need not rewrite it.
         self.last_status_state = ""
+        # How the radio listens (active, passive or shadow), for the panel; set once the radio has chosen.
+        self.scan_mode = "none"
         self._db = sqlite3.connect(self.db_path)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA foreign_keys = ON")
@@ -288,6 +291,11 @@ class Store:
         self._db.commit()
         self.put_setting("last_address", address.lower())
 
+    def trusted_beacons(self) -> list[str]:
+        """The beacon each trusted device was trusted from ("" for a cuff trusted before that was kept)."""
+        rows = self._db.execute("SELECT trusted_beacon FROM device WHERE trusted = 1 ORDER BY address").fetchall()
+        return [str(row["trusted_beacon"] or "") for row in rows]
+
     def trusted_beacon(self, address: str) -> str:
         row = self._db.execute(
             "SELECT trusted_beacon FROM device WHERE address = ?",
@@ -420,6 +428,25 @@ class Store:
             (address.lower() if address else None, _now(), kind, json.dumps(body, sort_keys=True)),
         )
         self._db.commit()
+
+    def count_telemetry_since(self, kind: str, seconds: float, **body: object) -> int:
+        """Rows of one kind written in the last `seconds` whose body holds every given key and value."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat(timespec="seconds")
+        rows = self._db.execute("SELECT body FROM telemetry WHERE kind = ? AND at >= ?", (kind, cutoff)).fetchall()
+        matching = [json.loads(row["body"]) for row in rows]
+        return sum(1 for found in matching if all(found.get(key) == value for key, value in body.items()))
+
+    def windows_missed_in_a_row(self) -> int:
+        """`window-missed` rows since the last `connect-start`: the misses with no window heard between them."""
+        rows = self._db.execute(
+            "SELECT kind FROM telemetry WHERE kind IN ('window-missed', 'connect-start') ORDER BY id DESC LIMIT 16"
+        ).fetchall()
+        count = 0
+        for row in rows:
+            if row["kind"] != "window-missed":
+                break
+            count += 1
+        return count
 
     def update_device(self, address: str, **fields: object) -> None:
         self.trust(address)
@@ -577,6 +604,7 @@ class Store:
             "link": bool(fields.get("link", False)),
             "error": str(fields.get("error", ""))[:160],
             "trusted": int(self._db.execute("SELECT COUNT(*) AS n FROM device WHERE trusted = 1").fetchone()["n"]),
+            "scan": self.scan_mode,
         }
         if set(document) != set(STATUS_KEYS):
             raise RuntimeError("status document gained a field")

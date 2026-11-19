@@ -40,7 +40,7 @@ if ! "$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; th
   status_tmp="$state/status.json.tmp"
   (
     umask 077
-    printf '{"state": "setup", "concern": "none", "records": 0, "unassigned": 0, "patients": 0, "beacon": "none", "link": false, "error": "%s", "trusted": 0}\n' \
+    printf '{"state": "setup", "concern": "none", "records": 0, "unassigned": 0, "patients": 0, "beacon": "none", "link": false, "error": "%s", "trusted": 0, "scan": "none"}\n' \
       "$problem" >"$status_tmp"
   )
   mv -f -- "$status_tmp" "$state/status.json"
