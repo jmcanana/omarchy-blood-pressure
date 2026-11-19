@@ -93,7 +93,47 @@ So passive scanning is proved in shadow before it is used (`pressure/shadow.py`)
 1. **Three shadow trials** (pattern matching): for three real measurements, `monitor-active` rows for all four monitors, a `window` row and a `tail` row in the window (before that sync's `connect-start`), `apple-shape` at 23, and `connect-start` and `connect-end` rows showing the sync went as before. Met by three measurements on November 18, 2026; each trial ended itself after 30 minutes and set `scan-mode` back to `active`.
 2. **One quiet-only measurement** (passive delivery): the same four monitors registered with the plugin disabled, so no client was discovering, and a `window` and a `tail` match heard from the trusted cuff. Met on November 19, 2026. All four monitors activated, and with `Discovering` false they heard the cuff's idle iBeacon, the START burst (41 company matches), and about 4.5 minutes later the window: window, company, tail and iBeacon matches within one second of each other. The plugin, enabled again while the window was still open, synced that reading. Limits: one measurement, and `Discovering` was polled every 10 s, not watched. The script and its logs are kept with the review records.
 
-The passive mode itself, with its own scan-loss rule (`Discovering` stays false under a monitor) and an automatic fallback to active, is not written yet.
+### Passive mode (design for review; not written yet)
+
+**`passive` listens through one advertisement monitor, falls back to `active` by itself when listening fails, and leaves the sync unchanged from the connect onwards.** The shipped default stays `active` in this release (see Default below).
+
+- **Choosing it.** `passive` joins `active` and `shadow` in the `scan-mode` file. The sidecar runs passive only when at least one cuff is trusted and every trusted device was trusted from the transfer window. With no trusted cuff, or with a monitor trusted as generic, it runs active and says why in its `scan-mode` row (`{"mode": "active", "wanted": "passive", "why": …}`).
+- **The generic path stays active-only.** A generic monitor's `0x1810` UUID can sit anywhere in its UUID list, but an or-pattern matches at one fixed offset, and a passive scan never receives the scan response where such a monitor may carry its name. No generic monitor has been tested here. To add one, write `active`.
+- **What it listens for.** One `AdvertisementMonitor1` with two or-patterns: company 105 at offset 0 of manufacturer data (`69 00`: the START burst, the window, and any other A&D device), and the transfer tail `a1030001c3` at offset 20 of Apple's manufacturer data. Both matched in the four shadow trials and in the quiet-only run; `apple-shape` 23 fixes the offset.
+- **How a match becomes a sighting.** BlueZ calls `DeviceFound(path)` on every matching advert. The sidecar then reads that device's `Device1` properties (`Address`, `Name`, `ManufacturerData`, `UUIDs`) on its own bus connection, at most one read in flight per device. It passes them to the same classifier and decisions as the active scan (`beacon_class`, `should_connect`, `should_drain`, trust and `seen`). BlueZ keeps the last value per company on a paired device, so a read during the window returns the `02` payload and the Apple tail together, as the active scan's callback does. The quiet-only run read lengths 23 (Apple) and 6 (company 105) this way.
+  - This is the path the November 19 run proved. R2's route B used bleak's passive scanner instead, which delivers the same `Device1` changes through bleak's own callback, but bleak's monitor only logs `Release` at debug level, and November 7's deaf trial ran on that scanner with patterns that are now lost. **Question for review:** our monitor and a `Device1` read, or bleak's passive scanner with a logging hook for `Release`?
+- **Untrusted devices.** Another A&D cuff matches the company pattern and shows the trust card as today. Other monitors are not heard.
+- **The connect path is unchanged.** On the window the sidecar unregisters the monitor, then connects with an address string, so bleak rediscovers the cuff with a short active scan (up to 6 s) and connects, as today. That rediscovery briefly creates objects for neighbours, which the shell logs; bounded and accepted. After the sync it registers the monitor again.
+- **Scan loss in passive mode.** `Discovering` stays false under a monitor, so that rule applies only in active mode. Passive treats these as a loss (telemetry `scan-lost` with `mode` and `reason`, exit 3, restart in 4 s):
+  - bluetoothd's bus name changes owner (a restart drops every monitor, and neither bleak nor BlueZ re-registers);
+  - the adapter's `Powered` goes false then true (whether bluetoothd restores a monitor after power-on is not known);
+  - BlueZ calls the monitor's `Release`.
+
+  Signals drive all three, on one system-bus connection kept for the sidecar's life. A 10 s poll of `Powered` and of `org.bluez`'s owner stays as the backstop for a missed signal.
+- **Automatic fallback to active.** The sidecar writes `active` to `scan-mode` (0600, atomic), records `scan-mode-fallback {"reason": …}`, and exits 3, when:
+  - `RegisterMonitor` is refused or times out (no `Experimental = true`, or an older stack);
+  - a third passive `scan-lost` falls within ten minutes (counted from telemetry at start, so it survives restarts);
+  - `Release` arrives without an owner change or power cycle within the previous 10 s;
+  - a trusted cuff's START burst is heard and no window follows within 10 minutes (`window-missed`). That reading stays on the cuff and syncs at the next measurement, in active mode. **Question for review:** fall back on the first miss, or the second?
+- **Rollback.** Write `active` to `scan-mode`, then disable and enable the plugin. No database or state file depends on the mode.
+- **What the panel shows.** `status.json` gains `scan` (`active`, `passive` or `shadow`). The device strip names it: "Full scan", "Quiet listening" or "Shadow trial".
+- **Default.** `active` stays the shipped default for this release; passive is opt-in. The evidence is one quiet-only measurement on one adapter and one BlueZ, and the first passive syncs have not run end to end. The fallback keeps a miss to one reading, but a user without `Experimental = true` gains nothing from passive. After five passive measurements sync with no `window-missed` or fallback, a later release can make `passive` the default. James's call.
+
+### Choosing the adapter (both modes)
+
+At every start the sidecar reads BlueZ's object tree and chooses the first adapter, in path order, whose `Roles` include `central` and whose `Powered` is true. With none, it waits and reads again every 10 s. It passes that adapter by name to the scanner, the client, the monitor and the watchdog, so all four use the same one. bleak alone would take the first powered central adapter in an unordered set, and the watchdog read `hci0` only.
+
+### Event-driven scan loss (both modes)
+
+The watchdog keeps one system-bus connection for the sidecar's life and listens to `PropertiesChanged` on the chosen adapter and `NameOwnerChanged` for `org.bluez`. A signal wakes the loop at once; the loop then reads the adapter's properties afresh and applies the rule for the mode, so the sidecar's own scanner stop around a connect is never mistaken for a loss. In active mode a change of `org.bluez` owner is a loss too. The 10 s poll stays.
+
+## The command channel
+
+The panel writes one command at a time to `command.json` and waits for `response.json` with the same id. If no response arrives in 4 s (a sidecar restarting, say), the panel used to drop the command and send the next, which could overwrite the first while it was still unread. Now:
+
+- **The panel re-sends the same command, with the same id,** at the head of its queue, every 4 s until its response arrives. Nothing behind it goes out first, so a command is never overwritten by a different one.
+- **The sidecar runs each id at most once,** short of a crash in the moment between a change and its record. It keeps the ids it has run in a private file (`commands.done`, 0600, the last 64), written before the claimed file is removed, and the last responses in memory. A repeated id gets its stored response again. After a restart, when that response is gone, a repeated read (`summary`, `patients`, `seen`, `telemetry`) runs again, and a repeated change (`add_patient`, `rename_patient`, `bind`, `trust`, `dismiss_seen`, `set_under_13`, `set_active`, `guideline`) answers `{"ok": true, "repeated": true}` without running.
+- R2 also suggested one file per id (`command-<id>.json`, claimed in order). With one command in flight and re-sends carrying the same id, only that command's own copy can ever replace it, so this design keeps one file. **Question for review:** is one file enough?
 
 ## Questions for review
 
